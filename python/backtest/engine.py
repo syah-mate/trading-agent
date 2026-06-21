@@ -10,8 +10,11 @@ PENTING:
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
+
+from dotenv import load_dotenv
 
 from core.mt5_client import MT5Client, detect_session, calculate_atr
 from core.openrouter_client import OpenRouterClient
@@ -295,6 +298,20 @@ class BacktestEngine:
         """Load historical candles dari MT5."""
         import MetaTrader5 as mt5
         import time as _time
+
+        # Re-initialize MT5 di thread ini (background thread FastAPI)
+        load_dotenv(override=True)
+        if not mt5.initialize(
+            login=int(os.getenv("MT5_LOGIN", "0")),
+            password=os.getenv("MT5_PASSWORD", ""),
+            server=os.getenv("MT5_SERVER", ""),
+        ):
+            error_code, error_desc = mt5.last_error()
+            logger.error(
+                "Backtest: mt5.initialize() gagal — %s (code=%s)",
+                error_desc, error_code,
+            )
+            return []
 
         # Pastikan simbol tersedia di Market Watch
         if not mt5.symbol_select(symbol, True):
