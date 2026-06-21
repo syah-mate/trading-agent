@@ -79,12 +79,24 @@ class BacktestEngine:
             self._mongo.update_backtest_run(run_id, {"status": "error", "error": error_msg})
             return
 
-        self._mongo.update_backtest_run(run_id, {"status": "running", "progress_pct": 0})
+        self._mongo.update_backtest_run(run_id, {
+            "status": "running",
+            "progress_pct": 0,
+            "current_candle": 0,
+            "trades_found": 0,
+        })
 
         try:
             # Load ALL historical candles
             all_candles = self._load_historical_candles(symbol, months_back, timeframe)
             total_candles = len(all_candles)
+
+            # Update progress setelah data berhasil di-load
+            self._mongo.update_backtest_run(run_id, {
+                "progress_pct": 1,
+                "current_candle": 100,
+                "trades_found": 0,
+            })
 
             if total_candles < 120:
                 self._mongo.update_backtest_run(run_id, {
@@ -110,8 +122,8 @@ class BacktestEngine:
                 candles_so_far = all_candles[0:i + 1]
                 current_candle = all_candles[i]
 
-                # Progress update setiap 500 candle
-                if i % 500 == 0:
+                # Progress update setiap 30 candle (lebih responsif di UI)
+                if i % 30 == 0:
                     pct = int(i / total_candles * 100)
                     self._mongo.update_backtest_run(run_id, {
                         "progress_pct": pct,
@@ -299,19 +311,21 @@ class BacktestEngine:
         import MetaTrader5 as mt5
         import time as _time
 
-        # Re-initialize MT5 di thread ini (background thread FastAPI)
+        # Re-initialize MT5 di thread ini HANYA jika belum terkoneksi
+        # (MT5Client.connect() mungkin sudah initialize di thread yang sama)
         load_dotenv(override=True)
-        if not mt5.initialize(
-            login=int(os.getenv("MT5_LOGIN", "0")),
-            password=os.getenv("MT5_PASSWORD", ""),
-            server=os.getenv("MT5_SERVER", ""),
-        ):
-            error_code, error_desc = mt5.last_error()
-            logger.error(
-                "Backtest: mt5.initialize() gagal — %s (code=%s)",
-                error_desc, error_code,
-            )
-            return []
+        if mt5.terminal_info() is None:
+            if not mt5.initialize(
+                login=int(os.getenv("MT5_LOGIN", "0")),
+                password=os.getenv("MT5_PASSWORD", ""),
+                server=os.getenv("MT5_SERVER", ""),
+            ):
+                error_code, error_desc = mt5.last_error()
+                logger.error(
+                    "Backtest: mt5.initialize() gagal — %s (code=%s)",
+                    error_desc, error_code,
+                )
+                return []
 
         # Pastikan simbol tersedia di Market Watch
         if not mt5.symbol_select(symbol, True):
