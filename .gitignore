@@ -1,0 +1,14 @@
+# Python
+python/venv/
+python/__pycache__/
+python/*.pyc
+python/.env          ← INI PALING PENTING, jangan sampai ke GitHub
+
+# SvelteKit
+svelte/node_modules/
+svelte/.svelte-kit/
+svelte/.env
+
+# OS
+.DS_Store
+Thumbs.db

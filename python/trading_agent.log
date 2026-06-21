@@ -1,0 +1,25 @@
+2026-06-21 09:48:53 [INFO] main: ============================================================
+2026-06-21 09:48:53 [INFO] main: AI Trading Agent — Starting
+2026-06-21 09:48:53 [INFO] main: Stack: Python + MT5 + OpenRouter + MongoDB
+2026-06-21 09:48:53 [INFO] main: ============================================================
+2026-06-21 09:48:53 [INFO] agents.orchestrator: ============================================================
+2026-06-21 09:48:53 [INFO] agents.orchestrator: Orchestrator starting...
+2026-06-21 09:48:53 [INFO] agents.orchestrator: ============================================================
+2026-06-21 09:48:57 [INFO] core.mt5_client: MT5Client: terkoneksi ke akun #229023498, server=HFMarketsGlobal-Live19, balance=0.00
+2026-06-21 09:48:57 [INFO] core.mongo_client: MongoClient: terkoneksi ke mongodb://localhost:27017 / trading_agent
+2026-06-21 09:48:57 [INFO] agents.orchestrator: Orchestrator: semua koneksi OK, mulai main loop
+2026-06-21 09:49:45 [INFO] agents.orchestrator: Orchestrator: shutting down...
+2026-06-21 09:49:45 [INFO] core.mongo_client: MongoClient: disconnected
+2026-06-21 09:49:45 [INFO] core.mt5_client: MT5Client: disconnected
+2026-06-21 09:49:45 [INFO] agents.orchestrator: Orchestrator: shutdown complete
+2026-06-21 09:49:45 [INFO] main: AI Trading Agent — Stopped
+2026-06-21 09:54:07 [INFO] main: ============================================================
+2026-06-21 09:54:07 [INFO] main: AI Trading Agent — Starting
+2026-06-21 09:54:07 [INFO] main: Stack: Python + MT5 + OpenRouter + MongoDB
+2026-06-21 09:54:07 [INFO] main: ============================================================
+2026-06-21 09:54:07 [INFO] agents.orchestrator: ============================================================
+2026-06-21 09:54:07 [INFO] agents.orchestrator: Orchestrator starting...
+2026-06-21 09:54:07 [INFO] agents.orchestrator: ============================================================
+2026-06-21 09:54:09 [INFO] core.mt5_client: MT5Client: terkoneksi ke akun #229023498, server=HFMarketsGlobal-Live19, balance=0.00
+2026-06-21 09:54:09 [INFO] core.mongo_client: MongoClient: terkoneksi ke mongodb://localhost:27017 / trading_agent
+2026-06-21 09:54:09 [INFO] agents.orchestrator: Orchestrator: semua koneksi OK, mulai main loop
