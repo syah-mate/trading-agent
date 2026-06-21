@@ -234,23 +234,23 @@ async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
 
     # Kick off backtest in background thread (MT5 tidak support async)
     def _run_in_thread():
-    import asyncio as _aio
-    loop = _aio.new_event_loop()
-    _aio.set_event_loop(loop)
-    try:
-        from backtest.engine import BacktestEngine as _Engine
-        _engine = _Engine()
-        loop.run_until_complete(
-            _engine.run(run_id, req.symbol, req.months_back, req.timeframe)
-        )
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error("Backtest thread error: %s", e, exc_info=True)
-    finally:
-        loop.close()
+        import asyncio as _aio
+        loop = _aio.new_event_loop()
+        _aio.set_event_loop(loop)
+        try:
+            from backtest.engine import BacktestEngine as _Engine
+            _engine = _Engine()
+            loop.run_until_complete(
+                _engine.run(run_id, req.symbol, req.months_back, req.timeframe)
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error("Backtest thread error: %s", e, exc_info=True)
+        finally:
+            loop.close()
 
-thread = threading.Thread(target=_run_in_thread, daemon=True)
-thread.start()
+    thread = threading.Thread(target=_run_in_thread, daemon=True)
+    thread.start()
 
     return {"run_id": run_id, "status": "started"}
 
