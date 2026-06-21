@@ -66,11 +66,8 @@
 	}
 
 	const models = [
-		'google/gemini-2.0-flash-001',
-		'google/gemini-2.5-pro-preview',
-		'anthropic/claude-3-haiku',
-		'meta-llama/llama-3-8b-instruct',
-		'openai/gpt-4o-mini'
+		'openai/gpt-4o-mini',
+		'x-ai/grok-4.3'
 	];
 </script>
 

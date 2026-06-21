@@ -6,7 +6,7 @@ Load semua env vars dengan python-dotenv, ekspor sebagai konstanta.
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ---------------------------------------------------------------------------
 # MT5 Credentials

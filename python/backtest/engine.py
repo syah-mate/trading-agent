@@ -47,6 +47,7 @@ class BacktestEngine:
         run_id: str,
         symbol: str = "XAUUSD",
         months_back: int = 6,
+        timeframe: str = "M15",
     ) -> None:
         """Jalankan backtest.
 
@@ -54,9 +55,10 @@ class BacktestEngine:
             run_id: MongoDB _id untuk backtest run record
             symbol: simbol trading
             months_back: berapa bulan ke belakang
+            timeframe: timeframe candle (M1, M5, M15, M30, H1, H4, D1, W1, MN1)
         """
         logger.info("=" * 60)
-        logger.info("Backtest: run_id=%s symbol=%s months=%d", run_id, symbol, months_back)
+        logger.info("Backtest: run_id=%s symbol=%s months=%d timeframe=%s", run_id, symbol, months_back, timeframe)
         logger.info("=" * 60)
 
         # Connect
@@ -67,11 +69,18 @@ class BacktestEngine:
             self._mongo.update_backtest_run(run_id, {"status": "error", "error": "MongoDB connect failed"})
             return
 
+        # Validasi OpenRouter API key wajib ada
+        if not self._llm._api_key:
+            error_msg = "OPENROUTER_API_KEY tidak diset di .env — backtest tidak bisa dijalankan"
+            logger.error("Backtest: %s", error_msg)
+            self._mongo.update_backtest_run(run_id, {"status": "error", "error": error_msg})
+            return
+
         self._mongo.update_backtest_run(run_id, {"status": "running", "progress_pct": 0})
 
         try:
             # Load ALL historical candles
-            all_candles = self._load_historical_candles(symbol, months_back)
+            all_candles = self._load_historical_candles(symbol, months_back, timeframe)
             total_candles = len(all_candles)
 
             if total_candles < 120:
@@ -280,18 +289,51 @@ class BacktestEngine:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _load_historical_candles(self, symbol: str, months_back: int) -> list[dict[str, Any]]:
+    def _load_historical_candles(
+        self, symbol: str, months_back: int, timeframe: str = "M15"
+    ) -> list[dict[str, Any]]:
         """Load historical candles dari MT5."""
         import MetaTrader5 as mt5
+        import time as _time
+
+        # Pastikan simbol tersedia di Market Watch
+        if not mt5.symbol_select(symbol, True):
+            error_code, error_desc = mt5.last_error()
+            logger.error(
+                "Backtest: symbol_select(%s) gagal — %s (code=%s)",
+                symbol, error_desc, error_code,
+            )
+            return []
+
+        # Tunggu sejenak agar data tersinkron
+        _time.sleep(0.1)
 
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=months_back * 30)
 
-        tf = mt5.TIMEFRAME_M15
+        # Resolve timeframe
+        _TIMEFRAME_MAP = {
+            "M1": mt5.TIMEFRAME_M1,
+            "M5": mt5.TIMEFRAME_M5,
+            "M15": mt5.TIMEFRAME_M15,
+            "M30": mt5.TIMEFRAME_M30,
+            "H1": mt5.TIMEFRAME_H1,
+            "H4": mt5.TIMEFRAME_H4,
+            "D1": mt5.TIMEFRAME_D1,
+            "W1": mt5.TIMEFRAME_W1,
+            "MN1": mt5.TIMEFRAME_MN1,
+        }
+        tf = _TIMEFRAME_MAP.get(timeframe.upper(), mt5.TIMEFRAME_M15)
+
         rates = mt5.copy_rates_range(symbol, tf, start, end)
 
         if rates is None or len(rates) == 0:
-            logger.error("Backtest: tidak ada data historical untuk %s", symbol)
+            error_code, error_desc = mt5.last_error()
+            logger.error(
+                "Backtest: tidak ada data historical untuk %s (tf=%s, %s → %s) — MT5 error: %s (code=%s)",
+                symbol, timeframe, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+                error_desc, error_code,
+            )
             return []
 
         result: list[dict[str, Any]] = []

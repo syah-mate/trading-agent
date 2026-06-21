@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "google/gemini-2.0-flash-001"
+DEFAULT_MODEL = "x-ai/grok-4.3"
 
 
 class OpenRouterClient:
@@ -33,7 +33,7 @@ class OpenRouterClient:
         model: str | None = None,
         api_key: str | None = None,
     ) -> None:
-        load_dotenv()
+        load_dotenv(override=True)
         self._api_key: str = api_key or os.getenv("OPENROUTER_API_KEY", "")
         self._model: str = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
         self._client: httpx.AsyncClient | None = None

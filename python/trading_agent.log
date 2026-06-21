@@ -31,3 +31,47 @@
 2026-06-21 10:05:02 [INFO] core.mt5_client: MT5Client: disconnected
 2026-06-21 10:05:02 [INFO] agents.orchestrator: Orchestrator: shutdown complete
 2026-06-21 10:05:02 [INFO] main: AI Trading Agent — Stopped
+2026-06-21 12:08:35 [INFO] main: ============================================================
+2026-06-21 12:08:35 [INFO] main: AI Trading Agent — Starting
+2026-06-21 12:08:35 [INFO] main: Stack: Python + MT5 + OpenRouter + MongoDB
+2026-06-21 12:08:35 [INFO] main: ============================================================
+2026-06-21 12:08:35 [INFO] agents.orchestrator: ============================================================
+2026-06-21 12:08:35 [INFO] agents.orchestrator: Orchestrator starting...
+2026-06-21 12:08:35 [INFO] agents.orchestrator: ============================================================
+2026-06-21 12:08:38 [INFO] core.mt5_client: MT5Client: terkoneksi ke akun #229023498, server=HFMarketsGlobal-Live19, balance=0.00
+2026-06-21 12:08:38 [INFO] core.mongo_client: MongoClient: terkoneksi ke mongodb://localhost:27017 / trading_agent
+2026-06-21 12:08:38 [INFO] agents.orchestrator: Orchestrator: semua koneksi OK, mulai main loop
+2026-06-21 12:13:09 [INFO] main: ============================================================
+2026-06-21 12:13:09 [INFO] main: AI Trading Agent — Starting
+2026-06-21 12:13:09 [INFO] main: Stack: Python + MT5 + OpenRouter + MongoDB
+2026-06-21 12:13:09 [INFO] main: ============================================================
+2026-06-21 12:13:09 [INFO] agents.orchestrator: ============================================================
+2026-06-21 12:13:09 [INFO] agents.orchestrator: Orchestrator starting...
+2026-06-21 12:13:09 [INFO] agents.orchestrator: ============================================================
+2026-06-21 12:13:09 [INFO] core.mt5_client: MT5Client: terkoneksi ke akun #229023498, server=HFMarketsGlobal-Live19, balance=0.00
+2026-06-21 12:13:09 [INFO] core.mongo_client: MongoClient: terkoneksi ke mongodb://localhost:27017 / trading_agent
+2026-06-21 12:13:09 [INFO] agents.orchestrator: Orchestrator: semua koneksi OK, mulai main loop
+2026-06-21 12:15:09 [INFO] agents.orchestrator: --- Cycle start: 2026-06-21T05:15:09.349037+00:00 [Asia] ---
+2026-06-21 12:15:09 [ERROR] core.mt5_client: get_candles(XAUUSD, M15, 200) gagal: (-1, 'Terminal: Call failed')
+2026-06-21 12:15:09 [WARNING] agents.orchestrator: Cycle: hanya 0 candle, skip
+2026-06-21 12:30:00 [INFO] agents.orchestrator: --- Cycle start: 2026-06-21T05:30:00.084516+00:00 [Asia] ---
+2026-06-21 12:30:00 [ERROR] core.mt5_client: get_candles(XAUUSD, M15, 200) gagal: (-1, 'Terminal: Call failed')
+2026-06-21 12:30:00 [WARNING] agents.orchestrator: Cycle: hanya 0 candle, skip
+2026-06-21 12:30:15 [INFO] agents.orchestrator: Orchestrator: shutting down...
+2026-06-21 12:30:15 [INFO] core.mongo_client: MongoClient: disconnected
+2026-06-21 12:30:15 [INFO] core.mt5_client: MT5Client: disconnected
+2026-06-21 12:30:15 [INFO] agents.orchestrator: Orchestrator: shutdown complete
+2026-06-21 12:30:15 [INFO] main: AI Trading Agent — Stopped
+2026-06-21 12:30:28 [INFO] main: ============================================================
+2026-06-21 12:30:28 [INFO] main: AI Trading Agent — Starting
+2026-06-21 12:30:28 [INFO] main: Stack: Python + MT5 + OpenRouter + MongoDB
+2026-06-21 12:30:28 [INFO] main: ============================================================
+2026-06-21 12:30:28 [INFO] agents.orchestrator: ============================================================
+2026-06-21 12:30:28 [INFO] agents.orchestrator: Orchestrator starting...
+2026-06-21 12:30:28 [INFO] agents.orchestrator: ============================================================
+2026-06-21 12:30:28 [INFO] core.mt5_client: MT5Client: terkoneksi ke akun #229023498, server=HFMarketsGlobal-Live19, balance=0.00
+2026-06-21 12:30:28 [INFO] core.mongo_client: MongoClient: terkoneksi ke mongodb://localhost:27017 / trading_agent
+2026-06-21 12:30:28 [INFO] agents.orchestrator: Orchestrator: semua koneksi OK, mulai main loop
+2026-06-21 12:30:28 [INFO] agents.orchestrator: --- Cycle start: 2026-06-21T05:30:28.107673+00:00 [Asia] ---
+2026-06-21 12:30:28 [ERROR] core.mt5_client: get_candles(XAUUSD, M15, 200) gagal: (-1, 'Terminal: Call failed')
+2026-06-21 12:30:28 [WARNING] agents.orchestrator: Cycle: hanya 0 candle, skip

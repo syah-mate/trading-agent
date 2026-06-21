@@ -233,7 +233,7 @@ async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
     # Kick off backtest in background task
     engine = BacktestEngine()
     asyncio.create_task(
-        engine.run(run_id, req.symbol, req.months_back)
+        engine.run(run_id, req.symbol, req.months_back, req.timeframe)
     )
 
     return {"run_id": run_id, "status": "started"}
