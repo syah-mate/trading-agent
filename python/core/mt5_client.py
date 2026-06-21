@@ -166,18 +166,12 @@ class MT5Client:
             return True
 
         if not mt5.initialize(
-    login=self._login,
-    password=self._password,
-    server=self._server,
-):
-    error = mt5.last_error()
-    logger.error("MT5 initialize() gagal: %s", error)
-    return False
-
-        if not authorized:
+            login=self._login,
+            password=self._password,
+            server=self._server,
+        ):
             error = mt5.last_error()
-            logger.error("MT5 login() gagal — %s", error)
-            mt5.shutdown()
+            logger.error("MT5 initialize() gagal: %s", error)
             return False
 
         self._connected = True
