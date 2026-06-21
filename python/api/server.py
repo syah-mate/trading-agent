@@ -57,8 +57,10 @@ last_cycle_at: datetime | None = None
 class BacktestStartRequest(BaseModel):
     symbol: str = "XAUUSD"
     timeframe: str = "M15"
-    months_back: int = 6
+    months_back: int | None = None
+    days_back: int | None = None
     lot_size: float = 0.01
+    initial_capital: float = 10000.0
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -224,11 +226,15 @@ async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
     from backtest.engine import BacktestEngine
 
     # Insert backtest run record
+    period_label = f"{req.months_back}mo" if req.months_back else f"{req.days_back}d" if req.days_back else "6mo"
     run_id = mongo_client.insert_backtest_run({
         "symbol": req.symbol,
         "timeframe": req.timeframe,
         "months_back": req.months_back,
+        "days_back": req.days_back,
+        "period": period_label,
         "lot_size": req.lot_size,
+        "initial_capital": req.initial_capital,
         "status": "starting",
     })
 
@@ -241,7 +247,7 @@ async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
             from backtest.engine import BacktestEngine as _Engine
             _engine = _Engine()
             loop.run_until_complete(
-                _engine.run(run_id, req.symbol, req.months_back, req.timeframe)
+                _engine.run(run_id, req.symbol, req.months_back, req.days_back, req.timeframe, req.initial_capital)
             )
         except Exception as e:
             import logging
@@ -276,6 +282,28 @@ async def get_backtest_progress(run_id: str) -> dict[str, Any]:
         "trades_found": run.get("trades_found", 0),
         "current_candle": run.get("current_candle", 0),
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /backtest/stop/{run_id}
+# ---------------------------------------------------------------------------
+
+@app.post("/backtest/stop/{run_id}")
+async def stop_backtest(run_id: str) -> dict[str, Any]:
+    """Set flag cancelling pada backtest run. Engine akan deteksi & berhenti."""
+    global mongo_client
+    if mongo_client is None:
+        raise HTTPException(500, "MongoDB not connected")
+
+    run = mongo_client.get_backtest_run(run_id)
+    if run is None:
+        raise HTTPException(404, f"Backtest run {run_id} not found")
+
+    if run.get("status") != "running":
+        raise HTTPException(400, f"Backtest tidak dalam status running (current: {run.get('status')})")
+
+    mongo_client.update_backtest_run(run_id, {"status": "cancelling"})
+    return {"success": True, "run_id": run_id, "message": "Cancelling — backtest akan berhenti dalam beberapa detik"}
 
 
 # ---------------------------------------------------------------------------

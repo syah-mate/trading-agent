@@ -67,7 +67,8 @@
 
 	const models = [
 		'openai/gpt-4o-mini',
-		'x-ai/grok-4.3'
+		'x-ai/grok-4.3',
+		'google/gemini-2.0-flash-001'
 	];
 </script>
 

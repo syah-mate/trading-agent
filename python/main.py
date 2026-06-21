@@ -1,6 +1,6 @@
 """
-Main Entry Point — TASK 4.4
-Inisialisasi semua clients & agents, jalankan orchestrator.
+Main Entry Point — v2.0 Single Agent Architecture
+Inisialisasi orchestrator dengan single TradingAgent.
 """
 
 import asyncio
@@ -43,8 +43,9 @@ async def main() -> None:
     logger = logging.getLogger("main")
 
     logger.info("=" * 60)
-    logger.info("AI Trading Agent — Starting")
+    logger.info("AI Trading Agent v2.0 — Single Agent Mode")
     logger.info("Stack: Python + MT5 + OpenRouter + MongoDB")
+    logger.info("Every 3 M15 candles → LLM analysis")
     logger.info("=" * 60)
 
     orchestrator = Orchestrator()

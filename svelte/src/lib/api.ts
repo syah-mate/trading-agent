@@ -47,8 +47,10 @@ export async function fetchBacktestProgress(runId: string) {
 export async function startBacktest(params: {
 	symbol: string;
 	timeframe: string;
-	months_back: number;
+	months_back?: number | null;
+	days_back?: number | null;
 	lot_size: number;
+	initial_capital: number;
 }) {
 	return fetchJSON(`${API_BASE}/backtest/start`, {
 		method: 'POST',
@@ -68,6 +70,10 @@ export async function updateConfig(config: Record<string, unknown>) {
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(config)
 	});
+}
+
+export async function stopBacktest(runId: string) {
+	return fetchJSON(`${API_BASE}/backtest/stop/${runId}`, { method: 'POST' });
 }
 
 // ---- Agent Control ----

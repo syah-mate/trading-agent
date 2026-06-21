@@ -43,6 +43,16 @@ class OpenRouterClient:
                 "OPENROUTER_API_KEY tidak diset — semua LLM call akan gagal."
             )
 
+    def set_model(self, model: str) -> None:
+        """Ganti model LLM secara runtime (mis. dari user config)."""
+        self._model = model
+        logger.info("OpenRouter model diset ke: %s", model)
+
+    @property
+    def model(self) -> str:
+        """Return model yang sedang aktif."""
+        return self._model
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Lazy-init async HTTP client (reuse connection)."""
         if self._client is None:

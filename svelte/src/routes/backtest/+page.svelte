@@ -1,5 +1,5 @@
 <script>
-	import { fetchBacktestRuns, startBacktest, fetchBacktestProgress } from '$lib/api';
+	import { fetchBacktestRuns, startBacktest, fetchBacktestProgress, stopBacktest } from '$lib/api';
 
 	let runs = $state([]);
 	let loading = $state(true);
@@ -7,13 +7,17 @@
 
 	// Form
 	let symbol = $state('XAUUSD');
+	let periodType = $state('months'); // 'days' | 'months'
 	let monthsBack = $state(3);
+	let daysBack = $state(10);
 	let lotSize = $state(0.01);
+	let initialCapital = $state(10000);
 
 	// Running state
 	let runningId = $state(null);
 	let progress = $state(null);
 	let pollingInterval = $state(null);
+	let stopping = $state(false);
 
 	// Detail view
 	let selectedRun = $state(null);
@@ -70,26 +74,42 @@
 
 	async function runBacktest() {
 		try {
-			const { run_id } = await startBacktest({
+			const params = {
 				symbol,
 				timeframe: 'M15',
-				months_back: monthsBack,
-				lot_size: lotSize
-			});
+				months_back: periodType === 'months' ? monthsBack : null,
+				days_back: periodType === 'days' ? daysBack : null,
+				lot_size: lotSize,
+				initial_capital: initialCapital
+			};
+			const { run_id } = await startBacktest(params);
 			runningId = run_id;
 			// Start polling
 			pollingInterval = setInterval(async () => {
 				try {
 					progress = await fetchBacktestProgress(run_id);
-					if (progress.status === 'completed' || progress.status === 'error') {
+					if (progress.status === 'completed' || progress.status === 'error' || progress.status === 'cancelled') {
 						clearInterval(pollingInterval);
 						pollingInterval = null;
+						runningId = null;
+						stopping = false;
 						loadRuns();
 					}
 				} catch (e) { /* ignore */ }
 			}, 3000);
 		} catch (e) {
 			alert('Gagal start backtest: ' + e.message);
+		}
+	}
+
+	async function cancelBacktest() {
+		if (!runningId) return;
+		stopping = true;
+		try {
+			await stopBacktest(runningId);
+		} catch (e) {
+			alert('Gagal stop backtest: ' + e.message);
+			stopping = false;
 		}
 	}
 
@@ -117,22 +137,59 @@
 			<input type="text" bind:value={symbol} class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm" />
 		</div>
 		<div>
-			<label class="text-sm text-gray-400 block mb-1">Months Back</label>
-			<input type="range" min="1" max="6" bind:value={monthsBack} class="w-full" />
-			<span class="text-sm text-gray-500">{monthsBack} months</span>
+			<label class="text-sm text-gray-400 block mb-1">Period</label>
+			<div class="flex gap-2 mb-2">
+				<button
+					onclick={() => periodType = 'days'}
+					class="px-3 py-1 rounded text-xs {periodType === 'days' ? 'bg-emerald-600 text-white' : 'bg-gray-800 text-gray-400'}"
+				>Days</button>
+				<button
+					onclick={() => periodType = 'months'}
+					class="px-3 py-1 rounded text-xs {periodType === 'months' ? 'bg-emerald-600 text-white' : 'bg-gray-800 text-gray-400'}"
+				>Months</button>
+			</div>
+			{#if periodType === 'days'}
+				<select bind:value={daysBack} class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm">
+					<option value={10}>10 Days</option>
+					<option value={20}>20 Days</option>
+					<option value={30}>30 Days</option>
+					<option value={60}>60 Days</option>
+					<option value={90}>90 Days</option>
+					<option value={180}>180 Days</option>
+				</select>
+			{:else}
+				<input type="range" min="1" max="6" bind:value={monthsBack} class="w-full" />
+				<span class="text-sm text-gray-500">{monthsBack} months</span>
+			{/if}
 		</div>
 		<div>
 			<label class="text-sm text-gray-400 block mb-1">Lot Size</label>
 			<input type="number" step="0.01" min="0.01" bind:value={lotSize} class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm" />
 		</div>
-		<div class="flex items-end">
+		<div>
+			<label class="text-sm text-gray-400 block mb-1">Initial Capital (USD)</label>
+			<input type="number" step="100" min="100" bind:value={initialCapital} class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm" />
+		</div>
+		<div class="flex items-end gap-2">
 			<button
 				onclick={runBacktest}
 				disabled={runningId !== null}
-				class="w-full px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm font-medium transition-colors"
+				class="flex-1 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm font-medium transition-colors"
 			>
 				{runningId ? 'Running...' : '▶ Run Backtest'}
 			</button>
+			{#if runningId && !stopping}
+				<button
+					onclick={cancelBacktest}
+					class="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm font-medium transition-colors"
+				>
+					⏹ Stop
+				</button>
+			{:else if stopping}
+				<button disabled class="px-4 py-2 bg-red-900/50 text-red-300 rounded-lg text-sm">
+					Stopping...
+				</button>
+			{/if}
 		</div>
 	</div>
 
@@ -166,7 +223,7 @@
 			<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
 				<div class="flex items-center justify-between mb-3">
 					<div>
-						<span class="text-sm font-medium">{run.symbol} · {run.months_back}mo · {run.lot_size} lot</span>
+						<span class="text-sm font-medium">{run.symbol} · {run.period || (run.months_back ? run.months_back + 'mo' : run.days_back ? run.days_back + 'd' : '?')} · {run.lot_size} lot · {formatCurrency(run.initial_capital || 10000)} capital</span>
 						<span class="ml-3 px-2 py-0.5 rounded text-xs {run.status === 'completed' ? 'bg-emerald-900/30 text-emerald-300' : run.status === 'error' ? 'bg-red-900/30 text-red-300' : 'bg-blue-900/30 text-blue-300'}">
 							{run.status}
 						</span>
@@ -232,7 +289,7 @@
 		<div class="bg-gray-900 border border-gray-700 rounded-xl max-w-3xl w-full max-h-[85vh] overflow-y-auto p-6" onclick={(e) => e.stopPropagation()}>
 			<div class="flex justify-between items-start mb-4">
 				<h2 class="text-lg font-bold">
-					{selectedRun.symbol} · {selectedRun.months_back}mo backtest
+					{selectedRun.symbol} · {selectedRun.period || (selectedRun.months_back ? selectedRun.months_back + 'mo' : selectedRun.days_back ? selectedRun.days_back + 'd' : '?')} · {selectedRun.lot_size} lot · {formatCurrency(selectedRun.initial_capital || 10000)} capital
 				</h2>
 				<button onclick={closeDetail} class="text-gray-400 hover:text-white text-2xl leading-none">&times;</button>
 			</div>

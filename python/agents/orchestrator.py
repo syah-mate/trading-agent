@@ -1,12 +1,14 @@
 """
-Orchestrator — TASK 4.1
-Master agent loop: jalankan sub-agents, evaluasi sinyal, eksekusi trade.
+Orchestrator v2.1 — Always-In Strategy Loop
 
-Siklus per candle M15:
-1. Ambil data → candles, price, session
-2. Jalankan VP + LS agents secara parallel
-3. Jika ada posisi aktif → monitor (skip evaluasi sinyal baru)
-4. Jika tidak ada posisi → evaluasi sinyal → eksekusi jika valid
+Setiap 3 candle M15 baru:
+1. Ambil data candle (200 candle)
+2. Jika ADA posisi aktif → SKIP (tunggu semua posisi closed)
+3. Jika TIDAK ada posisi → WAJIB ENTRY via TradingAgent LLM
+4. Tidak ada STANDBY — selalu open posisi dengan setup terbaik
+5. Rule-based fallback untuk null prices (current price + ATR)
+
+Semua analisis dilakukan oleh SATU LLM call melalui TradingAgent.
 """
 
 import asyncio
@@ -17,21 +19,21 @@ from typing import Any
 from core.mt5_client import MT5Client, detect_session, calculate_atr
 from core.openrouter_client import OpenRouterClient
 from core.mongo_client import MongoClient
-from agents.volume_profile import VolumeProfileAgent
-from agents.liquidity_sweep import LiquiditySweepAgent
-from agents.evaluator import EvaluatorAgent
+from agents.trading_agent import TradingAgent
 from agents.mt5_executor import MT5Executor
-from agents.position_monitor import PositionMonitorAgent
 from config import (
     SYMBOL, TIMEFRAME, LOT_SIZE, CANDLES_COUNT,
-    CONFIDENCE_THRESHOLD, CYCLE_INTERVAL_SECONDS,
+    CONFIDENCE_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)
 
+# Jumlah candle baru sebelum menjalankan agent
+CANDLE_INTERVAL = 3
+
 
 class Orchestrator:
-    """Master agent — mengatur siklus trading penuh."""
+    """Master loop — simplified single-agent architecture."""
 
     def __init__(self) -> None:
         # Core clients
@@ -39,26 +41,26 @@ class Orchestrator:
         self._llm = OpenRouterClient()
         self._mongo = MongoClient()
 
-        # Agents
-        self._vp_agent = VolumeProfileAgent()
-        self._ls_agent = LiquiditySweepAgent()
-        self._evaluator = EvaluatorAgent(self._llm)
+        # Single agent
+        self._agent = TradingAgent(self._llm)
+
+        # Executor
         self._executor = MT5Executor(symbol=SYMBOL, lot_size=LOT_SIZE)
-        self._monitor = PositionMonitorAgent(self._llm, self._executor)
 
         # State
         self._running: bool = False
-        self._last_candle_time: datetime | None = None
-        self._last_cycle_at: datetime | None = None
+        self._last_agent_candle_time: datetime | None = None
+        self._candles_since_last_run: int = 0
 
     # ------------------------------------------------------------------
     # Main Loop
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start main loop — konek ke MT5 & MongoDB, lalu loop forever."""
+        """Start main loop."""
         logger.info("=" * 60)
-        logger.info("Orchestrator starting...")
+        logger.info("Orchestrator v2.0 — Single Agent Mode Starting")
+        logger.info("Candle interval: every %d M15 candles", CANDLE_INTERVAL)
         logger.info("=" * 60)
 
         # Connect
@@ -71,23 +73,28 @@ class Orchestrator:
             self._mt5.disconnect()
             return
 
+        # Load LLM model dari user config (terpusat dari /config)
+        config = self._mongo.get_config()
+        llm_model = config.get("llm_model", "x-ai/grok-4.3")
+        self._llm.set_model(llm_model)
+        logger.info("Orchestrator: LLM model dari config = %s", llm_model)
+
         self._running = True
         logger.info("Orchestrator: semua koneksi OK, mulai main loop")
 
         try:
             while self._running:
                 try:
-                    # Cek flag dari MongoDB setiap cycle
+                    # Cek flag dari MongoDB
                     if not self._is_running_flag():
                         logger.info("Orchestrator: agent dihentikan via dashboard — waiting...")
-                        await asyncio.sleep(30)  # tunggu 30 detik, cek lagi
+                        await asyncio.sleep(30)
                         continue
 
-                    await self._wait_for_new_candle()
+                    await self._wait_for_candle_interval()
                     await self.run_cycle()
                 except Exception as e:
                     logger.error("Orchestrator cycle error: %s", e, exc_info=True)
-                    # Brief pause sebelum retry
                     await asyncio.sleep(5)
         except KeyboardInterrupt:
             logger.info("Orchestrator: KeyboardInterrupt diterima")
@@ -111,7 +118,7 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def run_cycle(self) -> dict[str, Any]:
-        """Jalankan 1 siklus trading penuh.
+        """Jalankan 1 siklus evaluasi trading.
 
         Returns:
             dict — ringkasan cycle untuk logging
@@ -127,50 +134,119 @@ class Orchestrator:
             logger.warning("Cycle: hanya %d candle, skip", len(candles))
             return {"status": "skip", "reason": "insufficient_candles"}
 
-        current_price = self._mt5.get_current_price(SYMBOL)
-        logger.debug("Current %s: bid=%.4f ask=%.4f", SYMBOL, current_price["bid"], current_price["ask"])
+        current_price_data = self._mt5.get_current_price(SYMBOL)
+        current_price = (current_price_data["bid"] + current_price_data["ask"]) / 2
+        logger.debug("Current %s: %.4f", SYMBOL, current_price)
 
-        # STEP 2: Jalankan sub-agents PARALEL
-        vp_result, sweep_result = await asyncio.gather(
-            asyncio.to_thread(self._vp_agent.analyze, candles),
-            asyncio.to_thread(self._ls_agent.analyze, candles),
-        )
-
-        # STEP 3: Log hasil sub-agents
-        self._mongo.insert_log({
-            "type": "sub_agents",
-            "cycle_at": cycle_start,
-            "session": session,
-            "vp": {
-                "poc": vp_result.get("poc"),
-                "vah": vp_result.get("vah"),
-                "val": vp_result.get("val"),
-            },
-            "sweep": {
-                "detected": sweep_result.get("sweep_detected"),
-                "direction": sweep_result.get("direction"),
-                "level": sweep_result.get("sweep_level"),
-                "candles_since": sweep_result.get("candles_since_sweep"),
-            },
-        })
-
-        # STEP 4: Cek posisi aktif
+        # STEP 2: Cek posisi aktif via MT5
         open_positions = self._mt5.get_open_positions()
 
         if open_positions:
-            logger.info("Cycle: %d posisi aktif — monitoring...", len(open_positions))
-            await self._monitor_positions(open_positions, candles, vp_result, sweep_result)
-            cycle_result = {"status": "monitored", "positions": len(open_positions)}
+            logger.info(
+                "Cycle: %d posisi aktif — SKIP (tidak ada monitoring)",
+                len(open_positions),
+            )
+            # Tetap log status
+            for pos in open_positions:
+                entry = float(pos.get("price_open", 0))
+                sl = float(pos.get("sl", 0))
+                tp = float(pos.get("tp", 0))
+                pnl = self._calc_pnl(pos, current_price)
+                logger.info(
+                    "  Pos #%d: %s entry=%.4f sl=%.4f tp=%.4f pnl=%+.2f",
+                    pos.get("ticket"),
+                    "BUY" if pos.get("type") in (0, "BUY") else "SELL",
+                    entry, sl, tp, pnl,
+                )
+
+            cycle_result = {
+                "status": "holding",
+                "positions": len(open_positions),
+                "reason": "Posisi aktif — menunggu SL/TP",
+            }
         else:
-            # STEP 5: Evaluasi sinyal baru
-            logger.info("Cycle: tidak ada posisi — evaluasi sinyal...")
-            cycle_result = await self._evaluate_and_trade(
-                vp_result, sweep_result, candles, session
+            # STEP 3: Tidak ada posisi → WAJIB ENTRY (v2.1 always-in)
+            logger.info("Cycle: tidak ada posisi — evaluasi sinyal via TradingAgent...")
+
+            atr = calculate_atr(candles, period=14)
+
+            # Get account info
+            account = self._mt5.get_account_info()
+            balance = account.get("balance", 10000.0)
+
+            # Load risk percent from config
+            config = self._mongo.get_config()
+            risk_percent = float(config.get("risk_percent", 1.0))
+
+            agent_result = await self._agent.analyze(
+                candles=candles,
+                position=None,
+                session=session,
+                atr=atr,
+                symbol=SYMBOL,
+                balance=balance,
+                risk_percent=risk_percent,
             )
 
-        self._last_cycle_at = cycle_start
+            # --- v2.1: Selalu isi null fields dengan kalkulasi rule-based ---
+            agent_result = self._fill_missing_prices(
+                agent_result, candles, current_price, atr, balance, risk_percent,
+            )
 
-        # Update status di MongoDB
+            # Log signal
+            self._mongo.insert_log({
+                "type": "agent_decision",
+                "cycle_at": cycle_start,
+                "session": session,
+                "decision": agent_result,
+            })
+
+            # Simpan signal ke MongoDB
+            self._mongo.insert_signal(agent_result)
+
+            # --- v2.1: Selalu eksekusi trade ---
+            direction = agent_result.get("direction")
+            confidence = agent_result.get("confidence", 0)
+            logger.info(
+                ">>> OPENING %s confidence=%d (always-in) <<<", direction, confidence,
+            )
+
+            trade = self._executor.open_position(agent_result)
+
+            if "error" in trade:
+                logger.error("Eksekusi trade gagal: %s", trade["error"])
+                cycle_result = {
+                    "status": "execution_failed",
+                    "error": trade["error"],
+                }
+            else:
+                # Simpan trade ke MongoDB
+                trade["symbol"] = SYMBOL
+                trade["confidence"] = confidence
+                trade["entry_reason"] = agent_result.get("reason", "")
+                trade["session"] = session
+                trade["bias_htf"] = agent_result.get("bias_htf")
+                trade["rr_ratio_t1"] = agent_result.get("rr_ratio_t1")
+                trade["rr_ratio_t2"] = agent_result.get("rr_ratio_t2")
+                trade["tp2_price"] = agent_result.get("tp2_price")
+                self._mongo.insert_trade(trade)
+
+                cycle_result = {
+                    "status": "trade_opened",
+                    "ticket": trade.get("ticket"),
+                    "direction": trade.get("direction"),
+                    "confidence": confidence,
+                }
+
+                logger.info(
+                    ">>> TRADE OPENED: ticket=%d %s entry=%.4f sl=%.4f tp=%.4f <<<",
+                    trade.get("ticket"), direction,
+                    trade.get("entry_price"),
+                    trade.get("sl"),
+                    trade.get("tp"),
+                )
+
+        # Update status
         self._mongo.insert_log({
             "type": "cycle_summary",
             "cycle_at": cycle_start,
@@ -182,132 +258,183 @@ class Orchestrator:
         return cycle_result
 
     # ------------------------------------------------------------------
-    # Position Monitoring
-    # ------------------------------------------------------------------
-
-    async def _monitor_positions(
-        self,
-        positions: list[dict[str, Any]],
-        candles: list[dict[str, Any]],
-        vp_result: dict[str, Any],
-        sweep_result: dict[str, Any],
-    ) -> None:
-        """Monitor semua posisi aktif via LLM."""
-        for position in positions:
-            try:
-                decision = await self._monitor.monitor(
-                    position, candles, vp_result, sweep_result
-                )
-                # Simpan ke MongoDB
-                self._mongo.append_monitoring_log(
-                    ticket=position["ticket"],
-                    log_entry=decision,
-                )
-                # Update trade record
-                self._mongo.update_trade(
-                    ticket=position["ticket"],
-                    update={
-                        "last_monitored_at": decision.get("monitored_at"),
-                        "last_decision": decision.get("decision"),
-                        "last_reasoning": decision.get("reasoning"),
-                    },
-                )
-            except Exception as e:
-                logger.error("Monitor posisi ticket=%d error: %s", position.get("ticket"), e)
-
-    # ------------------------------------------------------------------
-    # Signal Evaluation & Trade Execution
-    # ------------------------------------------------------------------
-
-    async def _evaluate_and_trade(
-        self,
-        vp_result: dict[str, Any],
-        sweep_result: dict[str, Any],
-        candles: list[dict[str, Any]],
-        session: str,
-    ) -> dict[str, Any]:
-        """Evaluasi sinyal baru, eksekusi jika valid."""
-        # Evaluasi via LLM
-        eval_result = await self._evaluator.evaluate(
-            vp_result, sweep_result, candles, session
-        )
-
-        # Simpan signal ke MongoDB
-        self._mongo.insert_signal(eval_result)
-
-        if not eval_result.get("is_valid"):
-            return {
-                "status": "no_signal",
-                "reason": eval_result.get("rejection_reason", "Sinyal tidak valid"),
-            }
-
-        confidence = eval_result.get("confidence", 0)
-        if confidence < CONFIDENCE_THRESHOLD:
-            logger.info(
-                "Signal valid tapi confidence %d < threshold %d — skip",
-                confidence, CONFIDENCE_THRESHOLD,
-            )
-            return {
-                "status": "low_confidence",
-                "confidence": confidence,
-                "threshold": CONFIDENCE_THRESHOLD,
-            }
-
-        # Eksekusi trade!
-        logger.info(">>> OPENING POSITION: %s confidence=%d <<<", eval_result.get("direction"), confidence)
-
-        trade = self._executor.open_position(eval_result)
-
-        if "error" in trade:
-            logger.error("Eksekusi trade gagal: %s", trade["error"])
-            return {"status": "execution_failed", "error": trade["error"]}
-
-        # Simpan trade ke MongoDB
-        trade["symbol"] = SYMBOL
-        trade["confidence"] = confidence
-        trade["entry_reason"] = eval_result.get("entry_reason", "")
-        trade["session"] = session
-        self._mongo.insert_trade(trade)
-
-        return {
-            "status": "trade_opened",
-            "ticket": trade.get("ticket"),
-            "direction": trade.get("direction"),
-            "confidence": confidence,
-        }
-
-    # ------------------------------------------------------------------
-    # Wait for new candle
+    # Wait for candle interval
     # ------------------------------------------------------------------
 
     def _is_running_flag(self) -> bool:
-        """Cek flag agent_running dari MongoDB config."""
+        """Cek apakah agent_running = True di MongoDB config."""
         try:
-            doc = self._mongo._db["config"].find_one({"_id": "agent_config"})
-            if doc is not None:
-                return doc.get("agent_running", True)
-            return True  # default: jalan jika belum ada config
+            config = self._mongo.get_config()
+            return config.get("agent_running", False)
         except Exception:
-            return True  # default: jalan jika MongoDB error
+            return True  # default: running
 
-    async def _wait_for_new_candle(self) -> None:
-        """Tunggu sampai candle M15 baru terbentuk.
+    async def _wait_for_candle_interval(self) -> None:
+        """Tunggu sampai CANDLE_INTERVAL candle M15 baru tersedia.
 
-        Cek setiap CYCLE_INTERVAL_SECONDS detik apakah menit sudah
-        berubah ke kelipatan 15 (0, 15, 30, 45).
+        Cek setiap 30 detik apakah candle baru sudah terbentuk.
         """
         while self._running:
-            now = datetime.now(timezone.utc)
-            minute = now.minute
-            second = now.second
+            # Ambil candle terbaru
+            candles = self._mt5.get_candles(SYMBOL, TIMEFRAME, 5)
+            if len(candles) < 2:
+                await asyncio.sleep(30)
+                continue
 
-            # Cek apakah ini menit kelipatan 15
-            if minute % 15 == 0:
-                # Cek apakah ini candle baru (beda dari last_candle_time)
-                candle_time = now.replace(second=0, microsecond=0)
-                if self._last_candle_time is None or candle_time > self._last_candle_time:
-                    self._last_candle_time = candle_time
-                    return  # Candle baru, lanjutkan cycle
+            latest_candle_time = candles[-1].get("time")
 
-            # Tunggu
-            await asyncio.sleep(CYCLE_INTERVAL_SECONDS)
+            if self._last_agent_candle_time is None:
+                # Pertama kali — catat candle saat ini
+                self._last_agent_candle_time = latest_candle_time
+                self._candles_since_last_run = 0
+                logger.info(
+                    "Orchestrator: initial candle tracked — %s",
+                    latest_candle_time,
+                )
+                await asyncio.sleep(30)
+                continue
+
+            if latest_candle_time != self._last_agent_candle_time:
+                # Candle baru!
+                self._candles_since_last_run += 1
+                self._last_agent_candle_time = latest_candle_time
+
+                if self._candles_since_last_run >= CANDLE_INTERVAL:
+                    self._candles_since_last_run = 0
+                    logger.info(
+                        "Orchestrator: %d candles elapsed — running agent",
+                        CANDLE_INTERVAL,
+                    )
+                    return
+
+            await asyncio.sleep(30)
+
+    # ------------------------------------------------------------------
+    # Fallback Price Filler (v2.1 — always-in)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fill_missing_prices(
+        agent_result: dict[str, Any],
+        candles: list[dict[str, Any]],
+        current_price: float,
+        atr: float,
+        balance: float,
+        risk_percent: float,
+    ) -> dict[str, Any]:
+        """Isi null prices dengan rule-based fallback agar trade tetap bisa dibuka.
+
+        Rules:
+        - entry_price = current_price
+        - SL = ATR × 1.5 dari entry (searah bias)
+        - TP1 = ATR × 1.5 dari entry (RR ~1:1)
+        - TP2 = ATR × 3.0 dari entry (RR ~1:2)
+        - lot_size = kalkulasi risk-based dari balance & SL distance
+        - direction = dari bias_htf, atau dari price vs mid-range
+        """
+        result = dict(agent_result)
+        direction = result.get("direction")
+        bias_htf = result.get("bias_htf", "")
+
+        # Tentukan direction jika null
+        if direction not in ("BUY", "SELL"):
+            # Fallback: bandingkan current price vs mid-range 100 candle
+            all_highs = [float(c["high"]) for c in candles[-100:]]
+            all_lows = [float(c["low"]) for c in candles[-100:]]
+            mid_range = (max(all_highs) + min(all_lows)) / 2
+            if current_price > mid_range:
+                direction = "BUY"
+                bias_htf = "BULLISH"
+            else:
+                direction = "SELL"
+                bias_htf = "BEARISH"
+            result["direction"] = direction
+            result["bias_htf"] = bias_htf
+            logger.info(
+                "_fill_missing_prices: direction auto-detected → %s (price %.2f vs mid %.2f)",
+                direction, current_price, mid_range,
+            )
+
+        # Fill entry_price
+        if result.get("entry_price") is None:
+            result["entry_price"] = round(current_price, 5)
+            logger.info("_fill_missing_prices: entry_price = current_price = %.5f", current_price)
+
+        entry = float(result["entry_price"])
+        sl_mult = 1.5
+        tp1_mult = 1.5
+        tp2_mult = 3.0
+
+        # Fill SL
+        if result.get("sl_price") is None:
+            if direction == "BUY":
+                result["sl_price"] = round(entry - atr * sl_mult, 5)
+            else:
+                result["sl_price"] = round(entry + atr * sl_mult, 5)
+            logger.info("_fill_missing_prices: sl_price = %.5f (ATR×%.1f)", result["sl_price"], sl_mult)
+
+        # Fill TP1
+        if result.get("tp1_price") is None:
+            if direction == "BUY":
+                result["tp1_price"] = round(entry + atr * tp1_mult, 5)
+            else:
+                result["tp1_price"] = round(entry - atr * tp1_mult, 5)
+            logger.info("_fill_missing_prices: tp1_price = %.5f (ATR×%.1f)", result["tp1_price"], tp1_mult)
+
+        # Fill TP2
+        if result.get("tp2_price") is None:
+            if direction == "BUY":
+                result["tp2_price"] = round(entry + atr * tp2_mult, 5)
+            else:
+                result["tp2_price"] = round(entry - atr * tp2_mult, 5)
+            logger.info("_fill_missing_prices: tp2_price = %.5f (ATR×%.1f)", result["tp2_price"], tp2_mult)
+
+        # Fill RR ratios
+        sl = float(result["sl_price"])
+        tp1 = float(result["tp1_price"])
+        tp2 = float(result["tp2_price"])
+
+        if result.get("rr_ratio_t1") is None:
+            r = abs(entry - sl)
+            r1 = abs(tp1 - entry)
+            result["rr_ratio_t1"] = round(r1 / r, 2) if r > 0 else 1.0
+
+        if result.get("rr_ratio_t2") is None:
+            r = abs(entry - sl)
+            r2 = abs(tp2 - entry)
+            result["rr_ratio_t2"] = round(r2 / r, 2) if r > 0 else 2.0
+
+        # Fill lot_size
+        if result.get("lot_size") is None:
+            risk_amount = balance * (risk_percent / 100.0)
+            sl_distance = abs(entry - sl)
+            # XAUUSD: 1 pip = 0.01, 1 lot = $10 per pip (approx)
+            sl_pips = sl_distance * 100  # konversi ke pip
+            if sl_pips > 0:
+                lot = risk_amount / (sl_pips * 10)
+                lot = max(0.01, round(lot, 2))  # min 0.01 lot
+            else:
+                lot = 0.01
+            result["lot_size"] = lot
+            logger.info(
+                "_fill_missing_prices: lot_size = %.2f (risk=$%.2f, sl_distance=%.4f)",
+                lot, risk_amount, sl_distance,
+            )
+
+        # Fill risk_percent
+        if result.get("risk_percent") is None:
+            result["risk_percent"] = risk_percent
+
+        return result
+
+    @staticmethod
+    def _calc_pnl(position: dict[str, Any], current_price: float) -> float:
+        """Hitung floating PnL posisi."""
+        direction = 1 if position.get("type") in (0, "BUY") else -1
+        entry = float(position.get("price_open", 0))
+        volume = float(position.get("volume", 0.01))
+        if direction == 1:
+            pips = (current_price - entry) * 10000
+        else:
+            pips = (entry - current_price) * 10000
+        return pips * volume * 10

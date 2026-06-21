@@ -39,7 +39,7 @@ MAX_DAILY_LOSS: float = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
 CONFIDENCE_THRESHOLD: int = int(os.getenv("CONFIDENCE_THRESHOLD", "70"))
 
 # ---------------------------------------------------------------------------
-# Orchestrator Settings
+# Orchestrator Settings (v2.0)
 # ---------------------------------------------------------------------------
-CYCLE_INTERVAL_SECONDS: int = 10  # Cek candle baru setiap N detik
 CANDLES_COUNT: int = 200  # Jumlah candle untuk analisis
+CANDLE_INTERVAL: int = 3  # Jalankan agent setiap N candle baru

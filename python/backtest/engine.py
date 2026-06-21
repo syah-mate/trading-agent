@@ -1,11 +1,11 @@
 """
-Backtest Engine — TASK 6.1
-Backtest strategy secara sequential (anti-lookahead).
+Backtest Engine v2.0 — Single Agent Mode
 
-PENTING:
-- Load semua historical candles, process candle by candle
-- VP dihitung dari candles[0:i] saja
-- LLM call dibatasi: monitor setiap 3 candle
+Menggunakan TradingAgent yang sama dengan live trading.
+Setiap 3 candle → evaluasi sinyal via LLM.
+Tidak ada position monitoring (menunggu SL/TP saja).
+
+Support: days_back (10, 20, 30, 60, 90, 180) dan months_back (1-6).
 """
 
 import asyncio
@@ -19,52 +19,56 @@ from dotenv import load_dotenv
 from core.mt5_client import MT5Client, detect_session, calculate_atr
 from core.openrouter_client import OpenRouterClient
 from core.mongo_client import MongoClient
-from agents.volume_profile import VolumeProfileAgent
-from agents.liquidity_sweep import LiquiditySweepAgent
-from agents.evaluator import EvaluatorAgent
+from agents.trading_agent import TradingAgent
 from backtest.reporter import generate_stats
 
 logger = logging.getLogger(__name__)
 
-# Rate limiting untuk LLM monitor: setiap N candle
-MONITOR_INTERVAL = 3
+EVAL_INTERVAL = 3  # Evaluasi setiap N candle
 
 
 class BacktestEngine:
-    """Backtest engine — run strategy pada historical data."""
+    """Backtest engine v2.0 — single agent, 3-candle interval."""
 
     def __init__(self) -> None:
         self._mt5 = MT5Client()
         self._llm = OpenRouterClient()
         self._mongo = MongoClient()
-        self._vp_agent = VolumeProfileAgent()
-        self._ls_agent = LiquiditySweepAgent()
-        self._evaluator = EvaluatorAgent(self._llm)
-
-    # ------------------------------------------------------------------
-    # Run
-    # ------------------------------------------------------------------
+        self._agent = TradingAgent(self._llm)
 
     async def run(
         self,
         run_id: str,
         symbol: str = "XAUUSD",
-        months_back: int = 6,
+        months_back: int | None = None,
+        days_back: int | None = None,
         timeframe: str = "M15",
+        initial_capital: float = 10000.0,
     ) -> None:
         """Jalankan backtest.
 
         Args:
             run_id: MongoDB _id untuk backtest run record
             symbol: simbol trading
-            months_back: berapa bulan ke belakang
-            timeframe: timeframe candle (M1, M5, M15, M30, H1, H4, D1, W1, MN1)
+            months_back: berapa bulan ke belakang (prioritas)
+            days_back: berapa hari ke belakang (jika months_back=None)
+            timeframe: timeframe candle
+            initial_capital: modal awal dalam USD (default $10,000)
         """
+        if months_back is not None and months_back > 0:
+            period_label = f"{months_back}mo"
+            total_days = months_back * 30
+        elif days_back is not None and days_back > 0:
+            period_label = f"{days_back}d"
+            total_days = days_back
+        else:
+            period_label = "6mo"
+            total_days = 180
+
         logger.info("=" * 60)
-        logger.info("Backtest: run_id=%s symbol=%s months=%d timeframe=%s", run_id, symbol, months_back, timeframe)
+        logger.info("Backtest v2.0: run_id=%s symbol=%s period=%s", run_id, symbol, period_label)
         logger.info("=" * 60)
 
-        # Connect
         if not self._mt5.connect():
             self._mongo.update_backtest_run(run_id, {"status": "error", "error": "MT5 connect failed"})
             return
@@ -72,229 +76,125 @@ class BacktestEngine:
             self._mongo.update_backtest_run(run_id, {"status": "error", "error": "MongoDB connect failed"})
             return
 
-        # Validasi OpenRouter API key wajib ada
+        # Load LLM model dari user config (terpusat dari /config)
+        config = self._mongo.get_config()
+        llm_model = config.get("llm_model", "x-ai/grok-4.3")
+        self._llm.set_model(llm_model)
+        logger.info("Backtest: LLM model dari config = %s", llm_model)
+
         if not self._llm._api_key:
-            error_msg = "OPENROUTER_API_KEY tidak diset di .env — backtest tidak bisa dijalankan"
-            logger.error("Backtest: %s", error_msg)
-            self._mongo.update_backtest_run(run_id, {"status": "error", "error": error_msg})
+            msg = "OPENROUTER_API_KEY tidak diset di .env"
+            self._mongo.update_backtest_run(run_id, {"status": "error", "error": msg})
             return
 
-        self._mongo.update_backtest_run(run_id, {
-            "status": "running",
-            "progress_pct": 0,
-            "current_candle": 0,
-            "trades_found": 0,
-        })
+        self._mongo.update_backtest_run(run_id, {"status": "running", "progress_pct": 0, "current_candle": 0, "trades_found": 0})
 
         try:
-            # Load ALL historical candles
-            all_candles = self._load_historical_candles(symbol, months_back, timeframe)
+            all_candles = self._load_historical_candles(symbol, total_days, timeframe)
             total_candles = len(all_candles)
-
-            # Update progress setelah data berhasil di-load
-            self._mongo.update_backtest_run(run_id, {
-                "progress_pct": 1,
-                "current_candle": 100,
-                "trades_found": 0,
-            })
+            self._mongo.update_backtest_run(run_id, {"progress_pct": 1, "current_candle": 100, "trades_found": 0})
 
             if total_candles < 120:
-                self._mongo.update_backtest_run(run_id, {
-                    "status": "error",
-                    "error": f"Hanya {total_candles} candle tersedia (min 120)",
-                })
+                self._mongo.update_backtest_run(run_id, {"status": "error", "error": f"Hanya {total_candles} candle (min 120)"})
                 return
 
             logger.info("Backtest: %d candles loaded", total_candles)
 
-            # State
             virtual_trades: list[dict[str, Any]] = []
             virtual_position: dict[str, Any] | None = None
             equity_curve: list[dict[str, Any]] = []
-            initial_balance = 10000.0
-            current_balance = initial_balance
+            current_balance = initial_capital
+            candles_since_eval = 0
 
-            # For rate-limiting LLM monitor calls
-            last_monitor_candle: int = -999
+            for i in range(100, total_candles):
+                # Cek cancel flag dari MongoDB setiap 10 candle
+                if i % 10 == 0 and self._is_cancelled(run_id):
+                    logger.info("Backtest: CANCELLED by user at candle %d/%d", i, total_candles)
+                    if virtual_position is not None:
+                        virtual_position["closed_at_candle"] = i
+                        virtual_position["exit_reason"] = "cancelled"
+                        virtual_position["exit_price"] = float(all_candles[i]["close"])
+                        virtual_position["exit_time"] = all_candles[i].get("time")
+                        virtual_position["pnl"] = self._calc_pnl(virtual_position)
+                        virtual_trades.append(virtual_position)
+                        virtual_position = None
+                    partial_stats = generate_stats(virtual_trades, initial_capital, equity_curve)
+                    self._mongo.update_backtest_run(run_id, {
+                        "status": "cancelled", "progress_pct": int(i / total_candles * 100),
+                        "trades_found": len(virtual_trades), "current_candle": i,
+                        "stats": partial_stats, "trades": virtual_trades, "equity_curve": equity_curve,
+                        "completed_at": datetime.now(timezone.utc), "period": period_label,
+                    })
+                    return
 
-            # Process candle by candle (anti-lookahead!)
-            for i in range(100, total_candles):  # Mulai dari candle 100 (min VP)
                 candles_so_far = all_candles[0:i + 1]
                 current_candle = all_candles[i]
 
-                # Progress update setiap 30 candle (lebih responsif di UI)
                 if i % 30 == 0:
                     pct = int(i / total_candles * 100)
-                    self._mongo.update_backtest_run(run_id, {
-                        "progress_pct": pct,
-                        "current_candle": i,
-                        "trades_found": len(virtual_trades),
-                    })
+                    self._mongo.update_backtest_run(run_id, {"progress_pct": pct, "current_candle": i, "trades_found": len(virtual_trades)})
                     logger.info("Backtest progress: %d/%d (%d%%)", i, total_candles, pct)
-
-                # Hitung VP & Sweep dari candles_so_far SAJA
-                vp_result = self._vp_agent.analyze(candles_so_far)
-                sweep_result = self._ls_agent.analyze(candles_so_far)
 
                 session = detect_session(current_candle.get("time", datetime.now(timezone.utc)))
 
-                # --- Jika ada virtual position ---
                 if virtual_position is not None:
-                    # Cek SL / TP hit
-                    exit_reason = self._check_exit(
-                        virtual_position, current_candle, all_candles, i
-                    )
-
+                    exit_reason = self._check_exit(virtual_position, current_candle)
                     if exit_reason:
-                        # Tutup posisi
                         virtual_position["closed_at_candle"] = i
                         virtual_position["exit_reason"] = exit_reason
                         virtual_position["exit_price"] = float(current_candle["close"])
                         virtual_position["exit_time"] = current_candle.get("time")
-
-                        # Hitung PnL
-                        pnl = self._calculate_pnl(virtual_position)
+                        pnl = self._calc_pnl(virtual_position)
                         virtual_position["pnl"] = pnl
                         current_balance += pnl
                         virtual_position["balance_after"] = current_balance
-
                         virtual_trades.append(virtual_position)
-                        equity_curve.append({
-                            "candle_index": i,
-                            "equity": current_balance,
-                            "event": f"close_{exit_reason}",
-                        })
-
-                        logger.info(
-                            "Backtest: CLOSE trade #%d at candle %d reason=%s pnl=%.2f",
-                            len(virtual_trades), i, exit_reason, pnl,
-                        )
-
+                        equity_curve.append({"candle_index": i, "equity": current_balance, "event": f"close_{exit_reason}"})
+                        logger.info("Backtest: CLOSE #%d at candle %d reason=%s pnl=%.2f", len(virtual_trades), i, exit_reason, pnl)
                         virtual_position = None
+                        candles_since_eval = 0
                     else:
-                        # Monitor posisi (LLM, tapi rate-limited)
-                        should_monitor = (
-                            (i - last_monitor_candle) >= MONITOR_INTERVAL
-                            or self._has_opposite_sweep(virtual_position, sweep_result)
-                        )
-
-                        if should_monitor:
-                            last_monitor_candle = i
-                            try:
-                                decision = await self._virtual_monitor(
-                                    virtual_position, candles_so_far, vp_result, sweep_result
-                                )
-                                virtual_position.setdefault("monitoring_log", []).append({
-                                    "candle_index": i,
-                                    "decision": decision.get("decision"),
-                                    "reasoning": decision.get("reasoning", ""),
-                                    "price_at_decision": float(current_candle["close"]),
-                                })
-
-                                # Eksekusi virtual
-                                if decision.get("decision") == "move_sl":
-                                    new_sl = decision.get("new_sl")
-                                    if new_sl:
-                                        virtual_position["sl"] = float(new_sl)
-                                elif decision.get("decision") == "close_all":
-                                    # Close via monitor decision
-                                    virtual_position["closed_at_candle"] = i
-                                    virtual_position["exit_reason"] = "llm_close_all"
-                                    virtual_position["exit_price"] = float(current_candle["close"])
-                                    virtual_position["exit_time"] = current_candle.get("time")
-                                    pnl = self._calculate_pnl(virtual_position)
-                                    virtual_position["pnl"] = pnl
-                                    current_balance += pnl
-                                    virtual_position["balance_after"] = current_balance
-                                    virtual_trades.append(virtual_position)
-                                    virtual_position = None
-                                    equity_curve.append({
-                                        "candle_index": i,
-                                        "equity": current_balance,
-                                        "event": "close_llm",
-                                    })
-                            except Exception as e:
-                                logger.error("Backtest monitor error at candle %d: %s", i, e)
-
-                    # Update equity curve (holding)
-                    if virtual_position is not None:
-                        unrealized = self._calculate_unrealized_pnl(
-                            virtual_position, float(current_candle["close"])
-                        )
-                        equity_curve.append({
-                            "candle_index": i,
-                            "equity": current_balance + unrealized,
-                            "event": "hold",
-                        })
-
-                # --- Jika tidak ada virtual position ---
+                        unrealized = self._calc_unrealized_pnl(virtual_position, float(current_candle["close"]))
+                        equity_curve.append({"candle_index": i, "equity": current_balance + unrealized, "event": "hold"})
                 else:
-                    try:
-                        eval_result = await self._evaluator.evaluate(
-                            vp_result, sweep_result, candles_so_far, session
-                        )
-
-                        if eval_result.get("is_valid") and eval_result.get("confidence", 0) >= 60:
-                            # Buka virtual position
-                            virtual_position = self._create_virtual_position(
-                                eval_result, current_candle, i
+                    candles_since_eval += 1
+                    if candles_since_eval >= EVAL_INTERVAL:
+                        candles_since_eval = 0
+                        try:
+                            atr = calculate_atr(candles_so_far, period=14)
+                            agent_result = await self._agent.analyze(
+                                candles=candles_so_far, position=None,
+                                session=session, atr=atr, symbol=symbol,
+                                balance=current_balance, risk_percent=1.0,
                             )
-                            equity_curve.append({
-                                "candle_index": i,
-                                "equity": current_balance,
-                                "event": f"open_{eval_result.get('direction', 'N/A')}",
-                            })
-                            logger.info(
-                                "Backtest: OPEN %s at candle %d price=%.4f",
-                                eval_result.get("direction"), i,
-                                virtual_position["entry_price"],
-                            )
-                    except Exception as e:
-                        logger.error("Backtest eval error at candle %d: %s", i, e)
+                            if agent_result.get("decision") == "ENTRY" and agent_result.get("confidence", 0) >= 60:
+                                virtual_position = self._create_virtual_position(agent_result, current_candle, i)
+                                equity_curve.append({"candle_index": i, "equity": current_balance, "event": f"open_{agent_result.get('direction', 'N/A')}"})
+                                logger.info("Backtest: OPEN %s at candle %d price=%.4f conf=%d", agent_result.get("direction"), i, virtual_position["entry_price"], agent_result.get("confidence", 0))
+                        except Exception as e:
+                            logger.error("Backtest agent error at candle %d: %s", i, e)
+                    equity_curve.append({"candle_index": i, "equity": current_balance, "event": "scan"})
 
-                    equity_curve.append({
-                        "candle_index": i,
-                        "equity": current_balance,
-                        "event": "scan",
-                    })
-
-            # --- Backtest selesai ---
-            # Tutup posisi yang masih terbuka di akhir
             if virtual_position is not None:
                 virtual_position["closed_at_candle"] = total_candles - 1
                 virtual_position["exit_reason"] = "end_of_data"
                 virtual_position["exit_price"] = float(all_candles[-1]["close"])
                 virtual_position["exit_time"] = all_candles[-1].get("time")
-                pnl = self._calculate_pnl(virtual_position)
-                virtual_position["pnl"] = pnl
+                virtual_position["pnl"] = self._calc_pnl(virtual_position)
                 virtual_trades.append(virtual_position)
 
-            # Generate stats
-            stats = generate_stats(virtual_trades, initial_balance, equity_curve)
-
-            # Simpan ke MongoDB
+            stats = generate_stats(virtual_trades, initial_capital, equity_curve)
             self._mongo.update_backtest_run(run_id, {
-                "status": "completed",
-                "progress_pct": 100,
-                "trades_found": len(virtual_trades),
-                "current_candle": total_candles,
-                "stats": stats,
-                "trades": virtual_trades,
-                "equity_curve": equity_curve,
-                "completed_at": datetime.now(timezone.utc),
+                "status": "completed", "progress_pct": 100,
+                "trades_found": len(virtual_trades), "current_candle": total_candles,
+                "stats": stats, "trades": virtual_trades, "equity_curve": equity_curve,
+                "completed_at": datetime.now(timezone.utc), "period": period_label,
             })
-
-            logger.info("=" * 60)
-            logger.info("Backtest COMPLETED: %d trades, win_rate=%.1f%%, profit_factor=%.2f",
-                        stats["total_trades"], stats["win_rate"], stats["profit_factor"])
-            logger.info("=" * 60)
+            logger.info("Backtest COMPLETED: %d trades, win_rate=%.1f%%, pf=%.2f", stats["total_trades"], stats["win_rate"], stats["profit_factor"])
 
         except Exception as e:
             logger.error("Backtest fatal error: %s", e, exc_info=True)
-            self._mongo.update_backtest_run(run_id, {
-                "status": "error",
-                "error": str(e)[:500],
-            })
+            self._mongo.update_backtest_run(run_id, {"status": "error", "error": str(e)[:500]})
         finally:
             self._mongo.disconnect()
             self._mt5.disconnect()
@@ -304,237 +204,86 @@ class BacktestEngine:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _load_historical_candles(
-        self, symbol: str, months_back: int, timeframe: str = "M15"
-    ) -> list[dict[str, Any]]:
-        """Load historical candles dari MT5."""
+    def _load_historical_candles(self, symbol: str, total_days: int, timeframe: str = "M15") -> list[dict[str, Any]]:
         import MetaTrader5 as mt5
         import time as _time
-
-        # Re-initialize MT5 di thread ini HANYA jika belum terkoneksi
-        # (MT5Client.connect() mungkin sudah initialize di thread yang sama)
         load_dotenv(override=True)
         if mt5.terminal_info() is None:
-            if not mt5.initialize(
-                login=int(os.getenv("MT5_LOGIN", "0")),
-                password=os.getenv("MT5_PASSWORD", ""),
-                server=os.getenv("MT5_SERVER", ""),
-            ):
-                error_code, error_desc = mt5.last_error()
-                logger.error(
-                    "Backtest: mt5.initialize() gagal — %s (code=%s)",
-                    error_desc, error_code,
-                )
+            if not mt5.initialize(login=int(os.getenv("MT5_LOGIN", "0")), password=os.getenv("MT5_PASSWORD", ""), server=os.getenv("MT5_SERVER", "")):
+                logger.error("Backtest: mt5.initialize() gagal")
                 return []
-
-        # Pastikan simbol tersedia di Market Watch
         if not mt5.symbol_select(symbol, True):
-            error_code, error_desc = mt5.last_error()
-            logger.error(
-                "Backtest: symbol_select(%s) gagal — %s (code=%s)",
-                symbol, error_desc, error_code,
-            )
+            logger.error("Backtest: symbol_select(%s) gagal", symbol)
             return []
-
-        # Tunggu sejenak agar data tersinkron
         _time.sleep(0.1)
-
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=months_back * 30)
-
-        # Resolve timeframe
-        _TIMEFRAME_MAP = {
-            "M1": mt5.TIMEFRAME_M1,
-            "M5": mt5.TIMEFRAME_M5,
-            "M15": mt5.TIMEFRAME_M15,
-            "M30": mt5.TIMEFRAME_M30,
-            "H1": mt5.TIMEFRAME_H1,
-            "H4": mt5.TIMEFRAME_H4,
-            "D1": mt5.TIMEFRAME_D1,
-            "W1": mt5.TIMEFRAME_W1,
-            "MN1": mt5.TIMEFRAME_MN1,
-        }
-        tf = _TIMEFRAME_MAP.get(timeframe.upper(), mt5.TIMEFRAME_M15)
-
+        start = end - timedelta(days=total_days)
+        tf_map = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1, "W1": mt5.TIMEFRAME_W1, "MN1": mt5.TIMEFRAME_MN1}
+        tf = tf_map.get(timeframe.upper(), mt5.TIMEFRAME_M15)
         rates = mt5.copy_rates_range(symbol, tf, start, end)
-
         if rates is None or len(rates) == 0:
-            error_code, error_desc = mt5.last_error()
-            logger.error(
-                "Backtest: tidak ada data historical untuk %s (tf=%s, %s → %s) — MT5 error: %s (code=%s)",
-                symbol, timeframe, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
-                error_desc, error_code,
-            )
+            logger.error("Backtest: tidak ada data historical untuk %s", symbol)
             return []
-
         result: list[dict[str, Any]] = []
         for r in rates:
-            result.append({
-                "time": datetime.fromtimestamp(r["time"], tz=timezone.utc),
-                "open": float(r["open"]),
-                "high": float(r["high"]),
-                "low": float(r["low"]),
-                "close": float(r["close"]),
-                "tick_volume": int(r["tick_volume"]),
-                "spread": int(r["spread"]) if "spread" in r.dtype.names else 0,
-            })
+            result.append({"time": datetime.fromtimestamp(r["time"], tz=timezone.utc), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"]), "tick_volume": int(r["tick_volume"]), "spread": int(r["spread"]) if "spread" in r.dtype.names else 0})
         return result
 
-    def _check_exit(
-        self,
-        position: dict[str, Any],
-        current_candle: dict[str, Any],
-        all_candles: list[dict[str, Any]],
-        candle_idx: int,
-    ) -> str | None:
-        """Cek apakah SL atau TP kena di candle ini.
-
-        Candle punya high/low — cek apakah harga menyentuh SL/TP.
-        """
+    def _check_exit(self, position: dict[str, Any], current_candle: dict[str, Any]) -> str | None:
         direction = position["direction"]
         sl = position.get("sl", 0)
         tp = position.get("tp", 0)
         high = float(current_candle["high"])
         low = float(current_candle["low"])
-
         if direction == "BUY":
-            if sl > 0 and low <= sl:
-                return "sl_hit"
-            if tp > 0 and high >= tp:
-                return "tp_hit"
+            if sl > 0 and low <= sl: return "sl_hit"
+            if tp > 0 and high >= tp: return "tp_hit"
         else:
-            if sl > 0 and high >= sl:
-                return "sl_hit"
-            if tp > 0 and low <= tp:
-                return "tp_hit"
-
+            if sl > 0 and high >= sl: return "sl_hit"
+            if tp > 0 and low <= tp: return "tp_hit"
         return None
 
-    def _calculate_pnl(self, position: dict[str, Any]) -> float:
-        """Hitung PnL dalam currency."""
-        entry = position.get("entry_price", 0)
-        exit_price = position.get("exit_price", 0)
-        direction = position.get("direction", "BUY")
-        lot_size = position.get("lot_size", 0.01)
-
-        if direction == "BUY":
-            pips = (exit_price - entry) * 10000
-        else:
-            pips = (entry - exit_price) * 10000
-
-        return pips * lot_size * 10  # aproksimasi: 1 pip = $10 per 0.1 lot
-
-    def _calculate_unrealized_pnl(self, position: dict[str, Any], current_price: float) -> float:
-        """Hitung unrealized PnL."""
-        entry = position.get("entry_price", 0)
-        direction = position.get("direction", "BUY")
-        lot_size = position.get("lot_size", 0.01)
-
-        if direction == "BUY":
-            pips = (current_price - entry) * 10000
-        else:
-            pips = (entry - current_price) * 10000
-
-        return pips * lot_size * 10
-
-    def _create_virtual_position(
-        self,
-        signal: dict[str, Any],
-        candle: dict[str, Any],
-        candle_idx: int,
-    ) -> dict[str, Any]:
-        """Buat virtual position dari sinyal."""
+    def _create_virtual_position(self, agent_result: dict[str, Any], candle: dict[str, Any], candle_idx: int) -> dict[str, Any]:
+        direction = agent_result.get("direction")
+        entry_price = agent_result.get("entry_price") or float(candle["close"])
         return {
-            "direction": signal.get("direction", "BUY"),
-            "entry_price": float(candle["close"]),
-            "sl": signal.get("sl_price", 0),
-            "tp": signal.get("tp1_price", 0),
-            "tp2": signal.get("tp2_price", 0),
-            "lot_size": 0.01,
+            "direction": direction,
+            "entry_price": float(entry_price),
+            "sl": float(agent_result.get("sl_price", 0) or 0),
+            "tp": float(agent_result.get("tp1_price", 0) or 0),
+            "tp2": float(tp2) if (tp2 := agent_result.get("tp2_price")) else None,
             "opened_at_candle": candle_idx,
-            "opened_at_time": candle.get("time"),
-            "confidence": signal.get("confidence", 0),
-            "entry_reason": signal.get("entry_reason", ""),
-            "session": signal.get("session", ""),
-            "monitoring_log": [],
+            "opened_at": candle.get("time"),
+            "entry_reason": agent_result.get("reason", ""),
+            "bias_htf": agent_result.get("bias_htf"),
+            "confidence": agent_result.get("confidence", 0),
+            "rr_ratio_t1": agent_result.get("rr_ratio_t1"),
+            "rr_ratio_t2": agent_result.get("rr_ratio_t2"),
+            "session": agent_result.get("session", "Other"),
+            "volume": 0.01,
         }
 
-    def _has_opposite_sweep(
-        self,
-        position: dict[str, Any],
-        sweep_result: dict[str, Any],
-    ) -> bool:
-        """Cek apakah ada sweep berlawanan arah."""
-        sweep_dir = sweep_result.get("direction")
-        pos_dir = position.get("direction")
-        if sweep_dir and pos_dir and sweep_dir != pos_dir:
-            candles_since = sweep_result.get("candles_since_sweep", 99)
-            return candles_since is not None and candles_since <= 3
-        return False
+    @staticmethod
+    def _calc_pnl(position: dict[str, Any]) -> float:
+        d = 1 if position["direction"] == "BUY" else -1
+        entry = float(position["entry_price"])
+        exit_p = float(position.get("exit_price", entry))
+        vol = float(position.get("volume", 0.01))
+        # XAUUSD: 1 lot = 100 oz, 0.01 lot = 1 oz, $1 move = $1
+        return ((exit_p - entry) if d == 1 else (entry - exit_p)) * 100 * vol
 
-    async def _virtual_monitor(
-        self,
-        position: dict[str, Any],
-        candles: list[dict[str, Any]],
-        vp_result: dict[str, Any],
-        sweep_result: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Virtual position monitor — panggil LLM."""
-        session = detect_session(datetime.now(timezone.utc))
-        atr = calculate_atr(candles, period=14)
-
-        # Build simplified metrics
-        current_price = float(candles[-1]["close"])
-        entry = position["entry_price"]
-        direction = position["direction"]
-
-        if direction == "BUY":
-            pnl_pips = (current_price - entry) * 10000
-        else:
-            pnl_pips = (entry - current_price) * 10000
-
-        floating_pnl = pnl_pips * 0.01 * 10
-
-        if position.get("sl", 0) > 0:
-            initial_risk = abs(entry - position["sl"])
-        else:
-            initial_risk = atr * 1.5
-
-        if initial_risk > 0:
-            current_rr = (current_price - entry) * (1 if direction == "BUY" else -1) / initial_risk
-        else:
-            current_rr = 0.0
-
-        candles_elapsed = len(candles) - position["opened_at_candle"]
-
-        last5 = candles[-5:]
-        last5_str = "\n".join([
-            f"  [{c['time']}] O={c['open']:.4f} H={c['high']:.4f} L={c['low']:.4f} C={c['close']:.4f}"
-            for c in last5
-        ])
-
-        system_prompt = """Kamu adalah manajer posisi trading profesional. Evaluasi apakah posisi harus
-dihold, SL-nya dipindah, atau ditutup. Respond HANYA dengan JSON."""
-
-        user_prompt = f"""Evaluasi posisi:
-
-Direction: {direction}
-Entry: {entry:.4f} | SL: {position.get('sl', 0):.4f} | TP: {position.get('tp', 0):.4f}
-Floating PnL: ${floating_pnl:.2f} | R:R: {current_rr:.2f}R | Candles: {candles_elapsed}
-ATR: {atr:.4f}
-
-VP: POC={vp_result.get('poc', 0):.4f} VAH={vp_result.get('vah', 0):.4f} VAL={vp_result.get('val', 0):.4f}
-Sweep: {sweep_result.get('direction')} (since {sweep_result.get('candles_since_sweep')} candles)
-Session: {session}
-
-Last 5 candles:
-{last5_str}
-
-Output JSON:
-{{"decision": "hold"|"move_sl"|"close_all", "new_sl": float|null, "reasoning": "..."}}"""
-
+    def _is_cancelled(self, run_id: str) -> bool:
+        """Cek apakah backtest dicancel user via MongoDB status."""
         try:
-            result = await self._llm.chat_json(system_prompt, user_prompt)
-            return result
+            run = self._mongo.get_backtest_run(run_id)
+            return run is not None and run.get("status") == "cancelling"
         except Exception:
-            return {"decision": "hold", "new_sl": None, "reasoning": "LLM error — hold"}
+            return False
+
+    @staticmethod
+    def _calc_unrealized_pnl(position: dict[str, Any], current_price: float) -> float:
+        d = 1 if position["direction"] == "BUY" else -1
+        entry = float(position["entry_price"])
+        vol = float(position.get("volume", 0.01))
+        # XAUUSD: 1 lot = 100 oz, 0.01 lot = 1 oz, $1 move = $1
+        return ((current_price - entry) if d == 1 else (entry - current_price)) * 100 * vol
