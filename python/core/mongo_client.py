@@ -271,7 +271,7 @@ class MongoClient:
                     "confidence_threshold": 70,
                     "sessions": {"London": True, "NewYork": True, "Overlap": True, "Asia": False},
                     "max_daily_loss": 50.0,
-                    "llm_model": "google/gemini-2.0-flash-001",
+                    "llm_model": "x-ai/grok-4.3",
                 }
             return dict(doc)
         except PyMongoError as e:

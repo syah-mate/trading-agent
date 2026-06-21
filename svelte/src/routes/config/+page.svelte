@@ -23,7 +23,7 @@
 				confidenceThreshold = config.confidence_threshold ?? 70;
 				sessions = config.sessions || { London: true, NewYork: true, Overlap: true, Asia: false };
 				maxDailyLoss = config.max_daily_loss ?? 50;
-				llmModel = config.llm_model || 'google/gemini-2.0-flash-001';
+				llmModel = config.llm_model || 'x-ai/grok-4.3';
 				rawConfig = config;
 			} catch (e) {
 				message = '❌ Gagal load config: ' + (e.message || 'Unknown error');
