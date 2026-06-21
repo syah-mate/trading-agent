@@ -69,3 +69,12 @@ export async function updateConfig(config: Record<string, unknown>) {
 		body: JSON.stringify(config)
 	});
 }
+
+// ---- Agent Control ----
+export async function startAgent() {
+	return fetchJSON(`${API_BASE}/agent/start`, { method: 'POST' });
+}
+
+export async function stopAgent() {
+	return fetchJSON(`${API_BASE}/agent/stop`, { method: 'POST' });
+}

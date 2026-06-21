@@ -1,11 +1,13 @@
 <script>
-	import { fetchStatus, fetchSignals, fetchTrades } from '$lib/api';
+	import { fetchStatus, fetchSignals, fetchTrades, startAgent, stopAgent } from '$lib/api';
 
 	let status = $state(null);
 	let signals = $state([]);
 	let trades = $state([]);
 	let loading = $state(true);
 	let error = $state('');
+	let toggling = $state(false);
+	let stats = $state(null);
 
 	async function loadData() {
 		loading = true;
@@ -16,10 +18,38 @@
 				fetchSignals(10),
 				fetchTrades(5)
 			]);
+
+			// Hitung stats dari trades
+			const closedTrades = trades.filter(t => t.pnl != null);
+			if (closedTrades.length > 0) {
+				const wins = closedTrades.filter(t => t.pnl > 0);
+				stats = {
+					total: closedTrades.length,
+					wins: wins.length,
+					winRate: (wins.length / closedTrades.length * 100).toFixed(1),
+					totalPnl: closedTrades.reduce((sum, t) => sum + (t.pnl || 0), 0)
+				};
+			}
 		} catch (e) {
 			error = e.message || 'Gagal fetch data dari API';
 		} finally {
 			loading = false;
+		}
+	}
+
+	async function toggleAgent() {
+		toggling = true;
+		try {
+			if (status?.agent_running) {
+				await stopAgent();
+			} else {
+				await startAgent();
+			}
+			status = await fetchStatus();
+		} catch (e) {
+			error = e.message || 'Gagal toggle agent';
+		} finally {
+			toggling = false;
 		}
 	}
 
@@ -59,6 +89,16 @@
 					<span class="text-sm text-gray-400">Status</span>
 				</div>
 				<p class="text-lg font-semibold mt-2">{status?.agent_running ? 'Running' : 'Stopped'}</p>
+				<button
+					onclick={toggleAgent}
+					disabled={toggling}
+					class="mt-3 w-full px-3 py-1.5 rounded-lg text-xs font-medium transition-colors
+						   {status?.agent_running
+							 ? 'bg-red-900/30 border border-red-700 text-red-300 hover:bg-red-900/50'
+							 : 'bg-emerald-900/30 border border-emerald-700 text-emerald-300 hover:bg-emerald-900/50'}"
+				>
+					{toggling ? '...' : status?.agent_running ? '⏹ Stop Agent' : '▶ Start Agent'}
+				</button>
 			</div>
 			<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
 				<span class="text-sm text-gray-400">Last Cycle</span>
@@ -164,4 +204,32 @@
 			🔄 Refresh Data
 		</button>
 	</div>
+
+	<!-- Stats -->
+	{#if stats}
+		<div class="mt-8 grid grid-cols-2 sm:grid-cols-4 gap-4">
+			<div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
+				<div class="text-xs text-gray-500 mb-1">Total Trades</div>
+				<div class="text-2xl font-bold">{stats.total}</div>
+			</div>
+			<div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
+				<div class="text-xs text-gray-500 mb-1">Win Rate</div>
+				<div class="text-2xl font-bold text-emerald-400">{stats.winRate}%</div>
+			</div>
+			<div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
+				<div class="text-xs text-gray-500 mb-1">Wins / Losses</div>
+				<div class="text-2xl font-bold">
+					<span class="text-emerald-400">{stats.wins}</span>
+					<span class="text-gray-600">/</span>
+					<span class="text-red-400">{stats.total - stats.wins}</span>
+				</div>
+			</div>
+			<div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
+				<div class="text-xs text-gray-500 mb-1">Total P&L</div>
+				<div class="text-2xl font-bold {stats.totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">
+					{formatCurrency(stats.totalPnl)}
+				</div>
+			</div>
+		</div>
+	{/if}
 {/if}

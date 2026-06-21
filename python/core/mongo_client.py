@@ -247,3 +247,47 @@ class MongoClient:
             return self._backtest_runs.find_one({"_id": ObjectId(run_id)})
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Config
+    # ------------------------------------------------------------------
+
+    @property
+    def _config(self) -> Collection:
+        if self._db is None:
+            raise RuntimeError("MongoClient belum connect()")
+        return self._db["config"]
+
+    def get_config(self) -> dict[str, Any]:
+        """Ambil agent config dari collection config.
+        Return default values jika dokumen belum ada.
+        """
+        try:
+            doc = self._config.find_one({"_id": "agent_config"})
+            if doc is None:
+                return {
+                    "symbol": "XAUUSD",
+                    "lot_size": 0.01,
+                    "confidence_threshold": 70,
+                    "sessions": {"London": True, "NewYork": True, "Overlap": True, "Asia": False},
+                    "max_daily_loss": 50.0,
+                    "llm_model": "google/gemini-2.0-flash-001",
+                }
+            return dict(doc)
+        except PyMongoError as e:
+            logger.error("MongoClient.get_config error: %s", e)
+            return {}
+
+    def upsert_config(self, updates: dict[str, Any]) -> bool:
+        """Upsert field ke agent config document."""
+        try:
+            updates["updated_at"] = datetime.now(timezone.utc)
+            self._config.update_one(
+                {"_id": "agent_config"},
+                {"$set": updates},
+                upsert=True,
+            )
+            return True
+        except PyMongoError as e:
+            logger.error("MongoClient.upsert_config error: %s", e)
+            return False

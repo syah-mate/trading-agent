@@ -60,6 +60,15 @@ class BacktestStartRequest(BaseModel):
     lot_size: float = 0.01
 
 
+class ConfigUpdateRequest(BaseModel):
+    symbol: str | None = None
+    lot_size: float | None = None
+    confidence_threshold: int | None = None
+    sessions: dict | None = None
+    max_daily_loss: float | None = None
+    llm_model: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Startup / Shutdown
 # ---------------------------------------------------------------------------
@@ -251,6 +260,86 @@ async def get_backtest_progress(run_id: str) -> dict[str, Any]:
         "trades_found": run.get("trades_found", 0),
         "current_candle": run.get("current_candle", 0),
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /config
+# ---------------------------------------------------------------------------
+
+@app.get("/config")
+async def get_config() -> dict[str, Any]:
+    """Return agent config dari MongoDB."""
+    global mongo_client
+    if mongo_client is None:
+        raise HTTPException(500, "MongoDB not connected")
+
+    config = mongo_client.get_config()
+    if not config:
+        config = {
+            "symbol": "XAUUSD",
+            "lot_size": 0.01,
+            "confidence_threshold": 70,
+            "sessions": {"London": True, "NewYork": True, "Overlap": True, "Asia": False},
+            "max_daily_loss": 50.0,
+            "llm_model": "google/gemini-2.0-flash-001",
+        }
+    return _serialize_doc(config)
+
+
+# ---------------------------------------------------------------------------
+# POST /config
+# ---------------------------------------------------------------------------
+
+@app.post("/config")
+async def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
+    """Update agent config di MongoDB."""
+    global mongo_client
+    if mongo_client is None:
+        raise HTTPException(500, "MongoDB not connected")
+
+    # Ambil hanya field yang tidak None
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+
+    if not updates:
+        return {"success": True, "updated_fields": []}
+
+    ok = mongo_client.upsert_config(updates)
+    if not ok:
+        raise HTTPException(500, "Gagal upsert config ke MongoDB")
+
+    return {"success": True, "updated_fields": list(updates.keys())}
+
+
+# ---------------------------------------------------------------------------
+# POST /agent/start
+# ---------------------------------------------------------------------------
+
+@app.post("/agent/start")
+async def start_agent() -> dict[str, Any]:
+    """Set agent_running = True di MongoDB."""
+    global mongo_client, agent_running
+    if mongo_client is None:
+        raise HTTPException(500, "MongoDB not connected")
+
+    agent_running = True
+    mongo_client.upsert_config({"agent_running": True})
+    return {"success": True, "agent_running": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /agent/stop
+# ---------------------------------------------------------------------------
+
+@app.post("/agent/stop")
+async def stop_agent() -> dict[str, Any]:
+    """Set agent_running = False di MongoDB."""
+    global mongo_client, agent_running
+    if mongo_client is None:
+        raise HTTPException(500, "MongoDB not connected")
+
+    agent_running = False
+    mongo_client.upsert_config({"agent_running": False})
+    return {"success": True, "agent_running": False}
 
 
 # ---------------------------------------------------------------------------

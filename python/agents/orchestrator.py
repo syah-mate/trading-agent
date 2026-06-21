@@ -77,6 +77,12 @@ class Orchestrator:
         try:
             while self._running:
                 try:
+                    # Cek flag dari MongoDB setiap cycle
+                    if not self._is_running_flag():
+                        logger.info("Orchestrator: agent dihentikan via dashboard — waiting...")
+                        await asyncio.sleep(30)  # tunggu 30 detik, cek lagi
+                        continue
+
                     await self._wait_for_new_candle()
                     await self.run_cycle()
                 except Exception as e:
@@ -273,6 +279,16 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Wait for new candle
     # ------------------------------------------------------------------
+
+    def _is_running_flag(self) -> bool:
+        """Cek flag agent_running dari MongoDB config."""
+        try:
+            doc = self._mongo._db["config"].find_one({"_id": "agent_config"})
+            if doc is not None:
+                return doc.get("agent_running", True)
+            return True  # default: jalan jika belum ada config
+        except Exception:
+            return True  # default: jalan jika MongoDB error
 
     async def _wait_for_new_candle(self) -> None:
         """Tunggu sampai candle M15 baru terbentuk.

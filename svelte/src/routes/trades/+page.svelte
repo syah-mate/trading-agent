@@ -9,6 +9,8 @@
 
 	let filterDirection = $state('');
 	let filterResult = $state('');
+	let filterDateFrom = $state('');
+	let filterDateTo = $state('');
 
 	async function loadTrades() {
 		loading = true;
@@ -52,6 +54,8 @@
 		if (filterDirection && t.direction !== filterDirection) return false;
 		if (filterResult === 'win' && (t.pnl == null || t.pnl <= 0)) return false;
 		if (filterResult === 'loss' && (t.pnl == null || t.pnl >= 0)) return false;
+		if (filterDateFrom && new Date(t.opened_at) < new Date(filterDateFrom)) return false;
+		if (filterDateTo && new Date(t.opened_at) > new Date(filterDateTo + 'T23:59:59')) return false;
 		return true;
 	}));
 </script>
@@ -81,6 +85,28 @@
 			<option value="win">Win</option>
 			<option value="loss">Loss</option>
 		</select>
+		<div class="flex items-center gap-2">
+			<label class="text-xs text-gray-500">From:</label>
+			<input
+				type="date"
+				bind:value={filterDateFrom}
+				class="bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-sm text-gray-300"
+			/>
+		</div>
+		<div class="flex items-center gap-2">
+			<label class="text-xs text-gray-500">To:</label>
+			<input
+				type="date"
+				bind:value={filterDateTo}
+				class="bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-sm text-gray-300"
+			/>
+		</div>
+		<button
+			onclick={() => { filterDateFrom = ''; filterDateTo = ''; filterDirection = ''; filterResult = ''; }}
+			class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-xs text-gray-400 transition-colors"
+		>
+			Reset Filters
+		</button>
 		<span class="text-sm text-gray-500 self-center ml-auto">
 			{filteredTrades.length} trades
 		</span>
