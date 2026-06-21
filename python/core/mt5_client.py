@@ -165,17 +165,15 @@ class MT5Client:
             logger.info("MT5Client: sudah terkoneksi, skip connect()")
             return True
 
-        if not mt5.initialize():
-            error = mt5.last_error()
-            logger.error("MT5 initialize() gagal: %s", error)
-            return False
+        if not mt5.initialize(
+    login=self._login,
+    password=self._password,
+    server=self._server,
+):
+    error = mt5.last_error()
+    logger.error("MT5 initialize() gagal: %s", error)
+    return False
 
-        # Login ke akun trading
-        authorized = mt5.login(
-            login=self._login,
-            password=self._password,
-            server=self._server,
-        )
         if not authorized:
             error = mt5.last_error()
             logger.error("MT5 login() gagal — %s", error)
