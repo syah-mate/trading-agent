@@ -137,3 +137,24 @@
 2026-06-21 17:00:25 [INFO] core.mt5_client: MT5Client: disconnected
 2026-06-21 17:00:25 [INFO] agents.orchestrator: Orchestrator: shutdown complete
 2026-06-21 17:00:25 [INFO] main: AI Trading Agent — Stopped
+2026-06-21 17:00:46 [INFO] main: ============================================================
+2026-06-21 17:00:46 [INFO] main: AI Trading Agent — Starting
+2026-06-21 17:00:46 [INFO] main: Stack: Python + MT5 + OpenRouter + MongoDB
+2026-06-21 17:00:46 [INFO] main: ============================================================
+2026-06-21 17:00:46 [INFO] agents.orchestrator: ============================================================
+2026-06-21 17:00:46 [INFO] agents.orchestrator: Orchestrator starting...
+2026-06-21 17:00:46 [INFO] agents.orchestrator: ============================================================
+2026-06-21 17:00:46 [INFO] core.mt5_client: MT5Client: terkoneksi ke akun #229023498, server=HFMarketsGlobal-Live19, balance=0.00
+2026-06-21 17:00:46 [INFO] core.mongo_client: MongoClient: terkoneksi ke mongodb://localhost:27017 / trading_agent
+2026-06-21 17:00:46 [INFO] agents.orchestrator: Orchestrator: semua koneksi OK, mulai main loop
+2026-06-21 17:00:46 [INFO] agents.orchestrator: --- Cycle start: 2026-06-21T10:00:46.987593+00:00 [London] ---
+2026-06-21 17:00:46 [INFO] agents.volume_profile: VolumeProfile: POC=4264.6100 VAH=4379.8900 VAL=4204.0900 HVN=15 LVN=41 vol=698145
+2026-06-21 17:00:46 [INFO] agents.liquidity_sweep: LiquiditySweep: BEARISH sweep detected at level 4178.4500
+2026-06-21 17:00:46 [INFO] agents.orchestrator: Cycle: tidak ada posisi — evaluasi sinyal...
+2026-06-21 17:00:46 [INFO] agents.evaluator: Evaluator: skip — sweep sudah 16 candle lalu (basi)
+2026-06-21 17:00:46 [INFO] agents.orchestrator: --- Cycle end: no_signal ---
+2026-06-21 17:04:42 [INFO] agents.orchestrator: Orchestrator: shutting down...
+2026-06-21 17:04:42 [INFO] core.mongo_client: MongoClient: disconnected
+2026-06-21 17:04:42 [INFO] core.mt5_client: MT5Client: disconnected
+2026-06-21 17:04:42 [INFO] agents.orchestrator: Orchestrator: shutdown complete
+2026-06-21 17:04:42 [INFO] main: AI Trading Agent — Stopped
