@@ -128,16 +128,21 @@ def generate_stats(
 # ---------------------------------------------------------------------------
 
 def _avg_rr(trades: list[dict[str, Any]]) -> float:
-    """Hitung rata-rata R:R dari list trades."""
+    """Hitung rata-rata R:R dari list trades.
+
+    Risk dihitung dengan formula yang SAMA dengan _calc_pnl di engine.py:
+        risk = abs(entry - sl) * 100 * volume
+    Untuk XAUUSD 0.01 lot: $1 move gold = $1 PnL.
+    """
     rrs: list[float] = []
     for t in trades:
         entry = t.get("entry_price", 0)
         sl = t.get("sl", 0)
         pnl = t.get("pnl", 0)
-        lot_size = t.get("lot_size", 0.01)
+        volume = t.get("volume", 0.01)
 
         if sl and sl > 0 and entry > 0:
-            risk = abs(entry - sl) * 10000 * lot_size * 10
+            risk = abs(entry - sl) * 100 * volume
             if risk > 0:
                 rrs.append(pnl / risk)
     return sum(rrs) / len(rrs) if rrs else 0.0

@@ -20,7 +20,7 @@ MT5_SERVER: str = os.getenv("MT5_SERVER", "")
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL: str = os.getenv(
-    "OPENROUTER_MODEL", "google/gemini-2.0-flash-001"
+    "OPENROUTER_MODEL", "google/gemini-2.5-flash-lite"
 )
 
 # ---------------------------------------------------------------------------

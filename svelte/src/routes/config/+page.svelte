@@ -6,7 +6,7 @@
 	let confidenceThreshold = $state(70);
 	let sessions = $state({ London: true, NewYork: true, Overlap: true, Asia: false });
 	let maxDailyLoss = $state(50);
-	let llmModel = $state('google/gemini-2.0-flash-001');
+	let llmModel = $state('google/gemini-2.5-flash-lite');
 	let loading = $state(true);
 	let saving = $state(false);
 	let message = $state('');
@@ -68,7 +68,7 @@
 	const models = [
 		'openai/gpt-4o-mini',
 		'x-ai/grok-4.3',
-		'google/gemini-2.0-flash-001'
+		'google/gemini-2.5-flash-lite'
 	];
 </script>
 

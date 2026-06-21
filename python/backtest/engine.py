@@ -142,7 +142,13 @@ class BacktestEngine:
                     if exit_reason:
                         virtual_position["closed_at_candle"] = i
                         virtual_position["exit_reason"] = exit_reason
-                        virtual_position["exit_price"] = float(current_candle["close"])
+                        # Gunakan level SL/TP sebagai exit price, BUKAN close candle
+                        if exit_reason == "sl_hit":
+                            virtual_position["exit_price"] = float(virtual_position["sl"])
+                        elif exit_reason == "tp_hit":
+                            virtual_position["exit_price"] = float(virtual_position["tp"])
+                        else:
+                            virtual_position["exit_price"] = float(current_candle["close"])
                         virtual_position["exit_time"] = current_candle.get("time")
                         pnl = self._calc_pnl(virtual_position)
                         virtual_position["pnl"] = pnl
@@ -150,7 +156,19 @@ class BacktestEngine:
                         virtual_position["balance_after"] = current_balance
                         virtual_trades.append(virtual_position)
                         equity_curve.append({"candle_index": i, "equity": current_balance, "event": f"close_{exit_reason}"})
-                        logger.info("Backtest: CLOSE #%d at candle %d reason=%s pnl=%.2f", len(virtual_trades), i, exit_reason, pnl)
+                        logger.info("Backtest: CLOSE #%d at candle %d reason=%s exit=%.4f pnl=%.2f", len(virtual_trades), i, exit_reason, virtual_position["exit_price"], pnl)
+                        # Margin call check — stop backtest jika equity habis
+                        if current_balance <= 0:
+                            logger.warning("Backtest: MARGIN CALL — equity depleted at candle %d/%d", i, total_candles)
+                            partial_stats = generate_stats(virtual_trades, initial_capital, equity_curve)
+                            self._mongo.update_backtest_run(run_id, {
+                                "status": "completed", "progress_pct": int(i / total_candles * 100),
+                                "trades_found": len(virtual_trades), "current_candle": i,
+                                "stats": partial_stats, "trades": virtual_trades, "equity_curve": equity_curve,
+                                "completed_at": datetime.now(timezone.utc), "period": period_label,
+                                "margin_call": True,
+                            })
+                            return
                         virtual_position = None
                         candles_since_eval = 0
                     else:
@@ -230,17 +248,41 @@ class BacktestEngine:
         return result
 
     def _check_exit(self, position: dict[str, Any], current_candle: dict[str, Any]) -> str | None:
+        """Cek apakah SL atau TP tersentuh dalam candle ini.
+
+        Jika keduanya tersentuh dalam candle yang sama, gunakan harga OPEN
+        untuk menentukan mana yang lebih dulu tercapai (lebih realistis).
+        """
         direction = position["direction"]
         sl = position.get("sl", 0)
         tp = position.get("tp", 0)
+        open_p = float(current_candle["open"])
         high = float(current_candle["high"])
         low = float(current_candle["low"])
+
         if direction == "BUY":
-            if sl > 0 and low <= sl: return "sl_hit"
-            if tp > 0 and high >= tp: return "tp_hit"
+            sl_hit = sl > 0 and low <= sl
+            tp_hit = tp > 0 and high >= tp
+            if sl_hit and tp_hit:
+                # Keduanya kena — tentukan mana yang lebih dulu
+                dist_to_sl = open_p - sl
+                dist_to_tp = tp - open_p
+                return "sl_hit" if dist_to_sl >= dist_to_tp else "tp_hit"
+            if sl_hit:
+                return "sl_hit"
+            if tp_hit:
+                return "tp_hit"
         else:
-            if sl > 0 and high >= sl: return "sl_hit"
-            if tp > 0 and low <= tp: return "tp_hit"
+            sl_hit = sl > 0 and high >= sl
+            tp_hit = tp > 0 and low <= tp
+            if sl_hit and tp_hit:
+                dist_to_sl = sl - open_p
+                dist_to_tp = open_p - tp
+                return "sl_hit" if dist_to_sl >= dist_to_tp else "tp_hit"
+            if sl_hit:
+                return "sl_hit"
+            if tp_hit:
+                return "tp_hit"
         return None
 
     def _create_virtual_position(self, agent_result: dict[str, Any], candle: dict[str, Any], candle_idx: int) -> dict[str, Any]:

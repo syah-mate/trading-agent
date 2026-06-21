@@ -59,7 +59,10 @@
 
 		const finalEquity = equityCurve[equityCurve.length - 1]?.equity ?? initialBalance;
 
-		return { points, minEquity, maxEquity, initialBalance, finalEquity };
+		// Y position of initial balance on the same scale as equity points
+		const initialBalanceY = 190 - ((initialBalance - minEquity) / range) * 180;
+
+		return { points, minEquity, maxEquity, initialBalance, finalEquity, initialBalanceY };
 	}
 
 	async function loadRuns() {
@@ -358,11 +361,12 @@
 				{@const chartData = drawEquityCurve(selectedRun.equity_curve, selectedRun.stats.initial_balance || 0)}
 				{#if chartData}
 					<h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Equity Curve</h3>
+					{@const balY = chartData.initialBalanceY}
 					<svg viewBox="0 0 600 220" class="w-full" style="background: #111827; border-radius: 8px;">
-						<line x1="10" y1="110" x2="590" y2="110" stroke="#374151" stroke-width="1" stroke-dasharray="4 2" />
+						<line x1="10" y1={balY} x2="590" y2={balY} stroke="#374151" stroke-width="1" stroke-dasharray="4 2" />
 						<text x="5" y="15" fill="#6B7280" font-size="9">{chartData.maxEquity.toFixed(0)}</text>
 						<text x="5" y="210" fill="#6B7280" font-size="9">{chartData.minEquity.toFixed(0)}</text>
-						<text x="5" y="115" fill="#6B7280" font-size="9">{chartData.initialBalance.toFixed(0)}</text>
+						<text x="5" y={balY + 5} fill="#6B7280" font-size="9">{chartData.initialBalance.toFixed(0)}</text>
 						<polyline
 							points={chartData.points}
 							fill="none"
