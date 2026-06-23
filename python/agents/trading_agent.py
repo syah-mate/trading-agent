@@ -208,28 +208,28 @@ class TradingAgent:
     ) -> str:
         """Build detailed user prompt with OHLCV data for LLM analysis."""
 
-        # H1 candles (ambil dari data jika available, atau downsample M15)
-        h1_candles = self._downsample_to_h1(candles)
+        # M15 candles — downsample dari M5 untuk HTF bias
+        m15_candles = self._downsample_to_m15(candles)
 
-        # Last 20 M15 candles (untuk analisis intraday)
-        recent_m15 = candles[-20:]
-        m15_str = "\n".join([
+        # Last 30 M5 candles (2.5 jam terakhir) — untuk setup entry
+        recent_m5 = candles[-30:]
+        m5_str = "\n".join([
             f"  [{self._fmt_time(c['time'])}] "
             f"O={c['open']:.2f} H={c['high']:.2f} L={c['low']:.2f} "
             f"C={c['close']:.2f} V={c.get('tick_volume', 0)}"
-            for c in recent_m15
+            for c in recent_m5
         ])
 
-        # Last 10 H1 candles (untuk HTF bias)
-        recent_h1 = h1_candles[-10:] if len(h1_candles) >= 10 else h1_candles
-        h1_str = "\n".join([
+        # Last 20 M15 candles (~5 jam terakhir) — untuk HTF bias
+        recent_m15 = m15_candles[-20:] if len(m15_candles) >= 20 else m15_candles
+        m15_str = "\n".join([
             f"  [{self._fmt_time(c['time'])}] "
             f"O={c['open']:.2f} H={c['high']:.2f} L={c['low']:.2f} "
             f"C={c['close']:.2f}"
-            for c in recent_h1
+            for c in recent_m15
         ])
 
-        # Key levels (highs/lows signifikan dari 100 candle)
+        # Key levels dari 100 candle M5 terakhir (~8 jam)
         all_highs = [float(c["high"]) for c in candles[-100:]]
         all_lows = [float(c["low"]) for c in candles[-100:]]
         recent_high = max(all_highs)
@@ -265,11 +265,11 @@ Recent High: {recent_high:.2f}
 Recent Low: {recent_low:.2f}
 Mid Range: {((recent_high + recent_low) / 2):.2f}
 
-=== H1 CANDLES (HTF Context - 10 terakhir) ===
-{h1_str}
-
-=== M15 CANDLES (M15 Bias - 20 terakhir) ===
+=== M15 CANDLES (HTF Bias - 20 terakhir, hasil downsample M5→M15) ===
 {m15_str}
+
+=== M5 CANDLES (Entry TF - 30 terakhir) ===
+{m5_str}
 
 === POSITION STATUS ===
 {position_str}
@@ -301,55 +301,64 @@ Respond HANYA dengan JSON, tidak ada teks lain."""
             return dt.strftime("%m/%d %H:%M")
         return str(dt)[:16] if dt else "?"
 
-    def _downsample_to_h1(self, candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Downsample M15 candles ke H1 dengan alignment ke boundary jam yang benar.
+    def _downsample_to_m15(self, candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Downsample M5 candles ke M15 dengan alignment ke boundary 15 menit yang benar.
 
-        Grouping berdasarkan (year, month, day, hour) dari timestamp tiap candle,
-        sehingga H1 yang dihasilkan selalu mencerminkan 1 jam kalender yang benar
-        tanpa bergantung pada posisi candle pertama dalam array.
+        Grouping berdasarkan 15-minute boundary dari timestamp tiap candle (UTC):
+          - menit 0–14  → slot 0
+          - menit 15–29 → slot 15
+          - menit 30–44 → slot 30
+          - menit 45–59 → slot 45
+
+        Setiap grup 3 candle M5 membentuk 1 candle M15.
 
         Args:
-            candles: list candle M15 dengan field 'time' berupa datetime atau string
+            candles: list candle M5 dengan field 'time' berupa datetime atau string ISO
 
         Returns:
-            list candle H1, diurutkan ascending by time
+            list candle M15, diurutkan ascending by time
         """
-        if len(candles) < 4:
+        if len(candles) < 3:
             return candles
 
-        # Group candles by hour boundary
         from collections import defaultdict
+        from datetime import datetime as _dt
+
         groups: dict[tuple, list[dict]] = defaultdict(list)
 
         for candle in candles:
             dt = candle.get("time")
             if isinstance(dt, str):
                 try:
-                    from datetime import datetime as _dt
                     dt = _dt.fromisoformat(dt.replace("Z", "+00:00"))
                 except (ValueError, TypeError):
                     continue
             if dt is None:
                 continue
 
-            # Key: (year, month, day, hour) — boundary jam UTC
-            hour_key = (dt.year, dt.month, dt.day, dt.hour)
-            groups[hour_key].append(candle)
+            # Boundary 15 menit: floor menit ke 0, 15, 30, atau 45
+            slot_minute = (dt.minute // 15) * 15
+            m15_key = (dt.year, dt.month, dt.day, dt.hour, slot_minute)
+            groups[m15_key].append(candle)
 
-        h1: list[dict] = []
-        for hour_key in sorted(groups.keys()):
-            chunk = groups[hour_key]
-            if len(chunk) == 0:
+        m15: list[dict] = []
+        for m15_key in sorted(groups.keys()):
+            chunk = groups[m15_key]
+            if not chunk:
                 continue
 
-            # Sort chunk by time untuk pastikan open = candle pertama, close = terakhir
+            # Sort by time untuk pastikan urutan open → close benar
             chunk_sorted = sorted(
                 chunk,
-                key=lambda c: c.get("time") if isinstance(c.get("time"), str) else c.get("time").isoformat() if c.get("time") else "",
+                key=lambda c: (
+                    c["time"] if isinstance(c["time"], str)
+                    else c["time"].isoformat() if c.get("time")
+                    else ""
+                ),
             )
 
-            h1.append({
-                "time": chunk_sorted[0].get("time"),   # open time = awal jam
+            m15.append({
+                "time": chunk_sorted[0].get("time"),          # open time = awal slot 15 menit
                 "open": float(chunk_sorted[0]["open"]),
                 "high": max(float(c["high"]) for c in chunk_sorted),
                 "low": min(float(c["low"]) for c in chunk_sorted),
@@ -357,19 +366,20 @@ Respond HANYA dengan JSON, tidak ada teks lain."""
                 "tick_volume": sum(int(c.get("tick_volume", 0)) for c in chunk_sorted),
             })
 
-        return h1
+        return m15
 
     @staticmethod
     def _calc_position_pnl(position: dict[str, Any], current_price: float) -> float:
-        """Hitung floating PnL posisi (aproksimasi USD)."""
+        """Hitung floating PnL posisi dalam USD (XAUUSD).
+
+        Formula: PnL = price_diff × volume × 100
+        Karena 1 lot XAUUSD = 100 oz, setiap $1 move = $100 per lot.
+        """
         direction = 1 if position.get("type") in (0, "BUY") else -1
         entry = float(position.get("price_open", position.get("entry_price", 0)))
         volume = float(position.get("volume", 0.01))
-        if direction == 1:
-            pnl_pips = (current_price - entry) * 10000
-        else:
-            pnl_pips = (entry - current_price) * 10000
-        return pnl_pips * volume * 10
+        price_diff = (current_price - entry) * direction
+        return price_diff * volume * 100
 
     # ------------------------------------------------------------------
     # Response Validation

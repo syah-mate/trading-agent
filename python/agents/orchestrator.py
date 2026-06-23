@@ -467,10 +467,10 @@ class Orchestrator:
         if result.get("lot_size") is None:
             risk_amount = balance * (risk_percent / 100.0)
             sl_distance = abs(entry - sl)
-            # XAUUSD: 1 pip = 0.01, 1 lot = $10 per pip (approx)
-            sl_pips = sl_distance * 100  # konversi ke pip
-            if sl_pips > 0:
-                lot = risk_amount / (sl_pips * 10)
+            # XAUUSD: 1 lot = $100 per $1 move (100 oz × $1)
+            # lot = risk_amount / (sl_distance × 100)
+            if sl_distance > 0:
+                lot = risk_amount / (sl_distance * 100)
                 lot = max(0.01, round(lot, 2))  # min 0.01 lot
             else:
                 lot = 0.01
@@ -488,12 +488,13 @@ class Orchestrator:
 
     @staticmethod
     def _calc_pnl(position: dict[str, Any], current_price: float) -> float:
-        """Hitung floating PnL posisi."""
+        """Hitung floating PnL posisi dalam USD (XAUUSD).
+
+        Formula: PnL = price_diff × volume × 100
+        Karena 1 lot XAUUSD = 100 oz, setiap $1 move = $100 per lot.
+        """
         direction = 1 if position.get("type") in (0, "BUY") else -1
         entry = float(position.get("price_open", 0))
         volume = float(position.get("volume", 0.01))
-        if direction == 1:
-            pips = (current_price - entry) * 10000
-        else:
-            pips = (entry - current_price) * 10000
-        return pips * volume * 10
+        price_diff = (current_price - entry) * direction
+        return price_diff * volume * 100
