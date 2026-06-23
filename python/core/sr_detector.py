@@ -118,6 +118,8 @@ class SRDetector:
                             kind="resistance",
                             formed_at=formed_at,
                         ))
+                        ft = formed_at.strftime("%Y-%m-%d %H:%M UTC") if isinstance(formed_at, datetime) else str(formed_at)
+                        logger.info("SRDetector: NEW RESISTANCE %.4f formed at %s", high_i, ft)
 
             # --- SWING LOW (Support) ---
             is_swing_low = (
@@ -136,6 +138,8 @@ class SRDetector:
                             kind="support",
                             formed_at=formed_at,
                         ))
+                        ft = formed_at.strftime("%Y-%m-%d %H:%M UTC") if isinstance(formed_at, datetime) else str(formed_at)
+                        logger.info("SRDetector: NEW SUPPORT %.4f formed at %s", low_i, ft)
 
         # Merge: pertahankan existing levels yang masih fresh, tambah yang baru
         existing_prices = {(round(lv.price, 2), lv.kind) for lv in self._levels}
@@ -191,9 +195,16 @@ class SRDetector:
                     )
                 else:
                     touched.append(level)
+                    # Format candle time untuk log
+                    time_str = ""
+                    if candle_time:
+                        if isinstance(candle_time, datetime):
+                            time_str = candle_time.strftime("%Y-%m-%d %H:%M UTC")
+                        else:
+                            time_str = str(candle_time)
                     logger.info(
-                        "SRDetector: TOUCH! price=%.4f level=%.4f (%s) test=%d/%d",
-                        current_price, level.price, level.kind,
+                        "SRDetector: TOUCH! candle=%s price=%.4f level=%.4f (%s) test=%d/%d",
+                        time_str or "N/A", current_price, level.price, level.kind,
                         level.test_count, self._max_tests,
                     )
 

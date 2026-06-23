@@ -77,7 +77,7 @@ class OpenRouterClient:
             "temperature": 0.3,  # low temp = lebih deterministik untuk trading
         }
 
-        logger.debug("OpenRouter request → model=%s", self._model)
+        logger.info("🤖 AI CALL → model=%s (%d chars prompt)", self._model, len(messages[-1]["content"]) if messages else 0)
         try:
             response = await client.post(OPENROUTER_BASE_URL, json=payload)
             response.raise_for_status()
@@ -90,7 +90,7 @@ class OpenRouterClient:
 
         data = response.json()
         content: str = data["choices"][0]["message"]["content"]
-        logger.debug("OpenRouter response (%d chars)", len(content))
+        logger.info("🤖 AI RESPONSE (%d chars):\n%s", len(content), content)
         return content
 
     # ------------------------------------------------------------------

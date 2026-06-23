@@ -242,7 +242,19 @@ class BacktestEngine:
 
                         virtual_trades.append(virtual_position)
                         equity_curve.append({"candle_index": i, "equity": current_balance, "event": f"close_{exit_reason}"})
-                        logger.info("Backtest: CLOSE #%d at candle %d reason=%s exit=%.4f pnl=%.2f", len(virtual_trades), i, exit_reason, virtual_position["exit_price"], pnl)
+                        # Format exit time untuk log
+                        et = virtual_position.get("exit_time")
+                        et_str = et.strftime("%Y-%m-%d %H:%M UTC") if isinstance(et, datetime) else str(et) if et else "?"
+                        pnl_sign = "+" if pnl >= 0 else ""
+                        logger.info(
+                            "Backtest: %s CLOSE #%d | %s | Exit=%.4f | PnL=%s%.2f USD | Balance=%.2f | candle %d [%s]",
+                            "🟢" if pnl >= 0 else "🔴",
+                            len(virtual_trades),
+                            "TP HIT" if exit_reason == "tp_hit" else "SL HIT" if exit_reason == "sl_hit" else exit_reason.upper(),
+                            virtual_position["exit_price"],
+                            pnl_sign, pnl,
+                            current_balance, i, et_str,
+                        )
                         # Margin call check — stop backtest jika equity habis
                         if current_balance <= 0:
                             logger.warning("Backtest: MARGIN CALL — equity depleted at candle %d/%d", i, total_candles)
@@ -303,9 +315,13 @@ class BacktestEngine:
                     # ── S/R DISENTUH → CALL AI UNTUK VALIDASI ──
                     sr_level = min(all_touched, key=lambda lv: abs(lv.price - current_price_close))
 
+                    # Format candle time untuk log
+                    ct = current_candle.get("time")
+                    ct_str = ct.strftime("%Y-%m-%d %H:%M UTC") if isinstance(ct, datetime) else str(ct)
+
                     logger.info(
-                        "Backtest: TOUCH candle=%d price_range=[%.4f,%.4f] level=%.4f (%s) — calling AI...",
-                        i, current_price_low, current_price_high, sr_level.price, sr_level.kind,
+                        "Backtest: SR TOUCH candle=%d [%s] price_range=[%.4f,%.4f] level=%.4f (%s) — calling AI...",
+                        i, ct_str, current_price_low, current_price_high, sr_level.price, sr_level.kind,
                     )
 
                     try:
@@ -336,9 +352,10 @@ class BacktestEngine:
                                 "event": f"open_{direction}",
                             })
                             logger.info(
-                                "Backtest: OPEN %s at candle %d price=%.4f conf=%d sr_level=%.4f (%s)",
-                                direction, i, current_price_close, confidence,
-                                sr_level.price, sr_level.kind,
+                                "Backtest: 🔵 OPEN %s | Entry=%.4f | SL=%.4f | TP=%.4f | Conf=%d | candle %d [%s]",
+                                direction, current_price_close,
+                                virtual_position["sl"], virtual_position["tp"],
+                                confidence, i, ct_str,
                             )
                             daily_trade_count[session_day_key] = trades_this_session + 1
                         else:

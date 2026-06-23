@@ -6,6 +6,7 @@ CORS: allow localhost:5173 (SvelteKit dev)
 """
 
 import logging
+import sys
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -18,6 +19,34 @@ from bson import ObjectId
 from core.mt5_client import MT5Client
 from core.mongo_client import MongoClient
 from core.openrouter_client import DEFAULT_MODEL
+
+# ---------------------------------------------------------------------------
+# Logging setup — harus dipanggil SEBELUM logger dibuat
+# ---------------------------------------------------------------------------
+
+def _setup_logging() -> None:
+    """Configure logging ke stdout + file (sinkron dengan main.py)."""
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=fmt,
+        datefmt=datefmt,
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("trading_agent.log", encoding="utf-8"),
+        ],
+    )
+
+    # Reduce noise from third-party libs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("pymongo").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
+_setup_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +297,8 @@ async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
     def _run_in_thread():
         global _backtest_running, _backtest_current_run_id
         import asyncio as _aio
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
         loop = _aio.new_event_loop()
         _aio.set_event_loop(loop)
         try:
@@ -277,15 +308,14 @@ async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
                 _engine.run(run_id, req.symbol, req.months_back, req.days_back, req.timeframe, req.initial_capital)
             )
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error("Backtest thread error: %s", e, exc_info=True)
+            _logger.error("Backtest thread error: %s", e, exc_info=True)
         finally:
             loop.close()
             # Reset flag setelah selesai (baik sukses maupun error)
             with _backtest_lock:
                 _backtest_running = False
                 _backtest_current_run_id = None
-            logging.getLogger(__name__).info("Backtest selesai — flag direset")
+            _logger.info("Backtest selesai — flag direset")
 
     thread = threading.Thread(target=_run_in_thread, daemon=True)
     thread.start()
