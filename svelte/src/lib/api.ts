@@ -72,6 +72,10 @@ export async function updateConfig(config: Record<string, unknown>) {
 	});
 }
 
+export async function fetchBacktestStatus() {
+	return fetchJSON(`${API_BASE}/backtest/status`);
+}
+
 export async function stopBacktest(runId: string) {
 	return fetchJSON(`${API_BASE}/backtest/stop/${runId}`, { method: 'POST' });
 }

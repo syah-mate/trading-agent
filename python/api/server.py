@@ -17,6 +17,7 @@ from bson import ObjectId
 
 from core.mt5_client import MT5Client
 from core.mongo_client import MongoClient
+from core.openrouter_client import DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +47,13 @@ app.add_middleware(
 # Global clients (diinisialisasi saat startup)
 mt5_client: MT5Client | None = None
 mongo_client: MongoClient | None = None
-agent_running: bool = False
-last_cycle_at: datetime | None = None
+
+# ---------------------------------------------------------------------------
+# Backtest state
+# ---------------------------------------------------------------------------
+_backtest_lock = threading.Lock()
+_backtest_running: bool = False
+_backtest_current_run_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +105,8 @@ async def shutdown() -> None:
 
 @app.get("/status")
 async def get_status() -> dict[str, Any]:
-    """Return status agent + account info."""
-    global agent_running, last_cycle_at, mt5_client
+    """Return status agent + account info. Baca agent_running dari MongoDB."""
+    global mt5_client, mongo_client
 
     account = {"balance": 0.0, "equity": 0.0, "free_margin": 0.0}
     open_positions_count = 0
@@ -110,9 +116,15 @@ async def get_status() -> dict[str, Any]:
         positions = mt5_client.get_open_positions()
         open_positions_count = len(positions)
 
+    # Baca state dari MongoDB — single source of truth
+    config = mongo_client.get_config() if mongo_client else {}
+    agent_running = config.get("agent_running", False)
+    last_cycle_at_raw = config.get("last_cycle_at")
+    last_cycle_at_str = last_cycle_at_raw.isoformat() if isinstance(last_cycle_at_raw, datetime) else last_cycle_at_raw
+
     return {
         "agent_running": agent_running,
-        "last_cycle_at": last_cycle_at.isoformat() if last_cycle_at else None,
+        "last_cycle_at": last_cycle_at_str,
         "open_positions": open_positions_count,
         "account": {
             "balance": account.get("balance", 0.0),
@@ -216,14 +228,25 @@ async def get_backtest_run(run_id: str) -> dict[str, Any]:
 
 @app.post("/backtest/start")
 async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
-    """Trigger backtest engine secara async. Return run_id."""
-    global mongo_client
+    """Trigger backtest engine secara async. Return run_id.
+    
+    Hanya 1 backtest yang boleh berjalan pada satu waktu.
+    Jika sudah ada backtest aktif, return 409 Conflict.
+    """
+    global mongo_client, _backtest_running, _backtest_current_run_id
     if mongo_client is None:
         raise HTTPException(500, "MongoDB not connected")
 
-    import asyncio
-    import threading
-    from backtest.engine import BacktestEngine
+    # Cek apakah ada backtest yang sedang berjalan
+    with _backtest_lock:
+        if _backtest_running:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Backtest sedang berjalan (run_id={_backtest_current_run_id}). "
+                       f"Hentikan dulu via POST /backtest/stop/{_backtest_current_run_id}"
+            )
+        _backtest_running = True
+        _backtest_current_run_id = None  # akan diisi setelah insert
 
     # Insert backtest run record
     period_label = f"{req.months_back}mo" if req.months_back else f"{req.days_back}d" if req.days_back else "6mo"
@@ -238,8 +261,12 @@ async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
         "status": "starting",
     })
 
+    with _backtest_lock:
+        _backtest_current_run_id = run_id
+
     # Kick off backtest in background thread (MT5 tidak support async)
     def _run_in_thread():
+        global _backtest_running, _backtest_current_run_id
         import asyncio as _aio
         loop = _aio.new_event_loop()
         _aio.set_event_loop(loop)
@@ -254,6 +281,11 @@ async def start_backtest(req: BacktestStartRequest) -> dict[str, Any]:
             logging.getLogger(__name__).error("Backtest thread error: %s", e, exc_info=True)
         finally:
             loop.close()
+            # Reset flag setelah selesai (baik sukses maupun error)
+            with _backtest_lock:
+                _backtest_running = False
+                _backtest_current_run_id = None
+            logging.getLogger(__name__).info("Backtest selesai — flag direset")
 
     thread = threading.Thread(target=_run_in_thread, daemon=True)
     thread.start()
@@ -307,6 +339,20 @@ async def stop_backtest(run_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# GET /backtest/status
+# ---------------------------------------------------------------------------
+
+@app.get("/backtest/status")
+async def get_backtest_status() -> dict[str, Any]:
+    """Return apakah ada backtest yang sedang berjalan saat ini."""
+    global _backtest_running, _backtest_current_run_id
+    return {
+        "is_running": _backtest_running,
+        "current_run_id": _backtest_current_run_id,
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /config
 # ---------------------------------------------------------------------------
 
@@ -325,7 +371,7 @@ async def get_config() -> dict[str, Any]:
             "confidence_threshold": 70,
             "sessions": {"London": True, "NewYork": True, "Overlap": True, "Asia": False},
             "max_daily_loss": 50.0,
-            "llm_model": "x-ai/grok-4.3",
+            "llm_model": DEFAULT_MODEL,
         }
     return _serialize_doc(config)
 
@@ -360,12 +406,11 @@ async def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
 
 @app.post("/agent/start")
 async def start_agent() -> dict[str, Any]:
-    """Set agent_running = True di MongoDB."""
-    global mongo_client, agent_running
+    """Set agent_running = True di MongoDB (single source of truth)."""
+    global mongo_client
     if mongo_client is None:
         raise HTTPException(500, "MongoDB not connected")
 
-    agent_running = True
     mongo_client.upsert_config({"agent_running": True})
     return {"success": True, "agent_running": True}
 
@@ -376,12 +421,11 @@ async def start_agent() -> dict[str, Any]:
 
 @app.post("/agent/stop")
 async def stop_agent() -> dict[str, Any]:
-    """Set agent_running = False di MongoDB."""
-    global mongo_client, agent_running
+    """Set agent_running = False di MongoDB (single source of truth)."""
+    global mongo_client
     if mongo_client is None:
         raise HTTPException(500, "MongoDB not connected")
 
-    agent_running = False
     mongo_client.upsert_config({"agent_running": False})
     return {"success": True, "agent_running": False}
 

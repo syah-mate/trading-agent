@@ -49,31 +49,33 @@ Format JSON:
 
 ```json
 {
-  "decision": "ENTRY",
-  "direction": "BUY" | "SELL",
-  "entry_price": number,
-  "sl_price": number,
-  "tp1_price": number,
-  "tp2_price": number,
-  "lot_size": number,
-  "rr_ratio_t1": number,
-  "rr_ratio_t2": number,
+  "decision": "ENTRY" | "STANDBY",
+  "direction": "BUY" | "SELL" | "NONE",
+  "entry_price": number | null,
+  "sl_price": number | null,
+  "tp1_price": number | null,
+  "tp2_price": number | null,
+  "lot_size": number | null,
+  "rr_ratio_t1": number | null,
+  "rr_ratio_t2": number | null,
   "confidence": number (0-100),
-  "bias_htf": "BULLISH" | "BEARISH",
+  "bias_htf": "BULLISH" | "BEARISH" | "RANGING",
   "intraday_phase": "TRENDING" | "PULLBACK" | "CONSOLIDATION",
-  "reason": "string — alasan singkat setup (max 300 chars)",
+  "reason": "string — alasan singkat (max 300 chars)",
   "invalidation": "string — kondisi yang membatalkan setup ini (max 200 chars)",
   "risk_percent": number
 }
 ```
 
-SEMUA field wajib diisi (tidak boleh null). Decision selalu "ENTRY".
+Jika decision = "STANDBY":
+- Isi "reason" dengan alasan jelas (mis. "M15 ranging, tidak ada bias jelas")
+- Field lain boleh null/0
+- direction boleh "NONE"
 
-Pastikan:
-- SL dan TP logis berdasarkan struktur harga (jika tidak ada struktur jelas, SL = ATR × 1.5 dari entry)
-- Usahakan RR Ratio T1 ≥ 1:1
-- Confidence mencerminkan kualitas setup (65-95 = setup bagus, 40-64 = setup biasa/fallback, <40 = sangat terpaksa)
-- direction HARUS sesuai bias_htf (BULLISH → BUY, BEARISH → SELL)
+Jika decision = "ENTRY":
+- SEMUA field wajib diisi
+- SL maksimum 10 pip dari entry
+- RR T1 minimum 0.8
 """
 
 
@@ -251,7 +253,7 @@ class TradingAgent:
 
         return f"""=== TRADING CONTEXT ===
 Symbol: {symbol}
-Timeframe: M15 (dengan konfirmasi H1)
+Timeframe: M5 (entry) / M15 (HTF bias)
 Session: {session}
 Current Price: {current_price:.2f}
 ATR (14): {atr:.4f}
@@ -266,7 +268,7 @@ Mid Range: {((recent_high + recent_low) / 2):.2f}
 === H1 CANDLES (HTF Context - 10 terakhir) ===
 {h1_str}
 
-=== M15 CANDLES (Intraday - 20 terakhir) ===
+=== M15 CANDLES (M15 Bias - 20 terakhir) ===
 {m15_str}
 
 === POSITION STATUS ===
@@ -274,14 +276,17 @@ Mid Range: {((recent_high + recent_low) / 2):.2f}
 
 ---
 
-Jalankan FULL TOP-DOWN ANALYSIS sesuai system prompt:
-1. FASE 1: Baca trend dominan dari H1, tentukan BIAS (BULLISH/BEARISH — tidak boleh RANGING)
-2. FASE 2: Tentukan level entry terbaik dari M15 sesuai prioritas setup (1 > 2 > 3 fallback)
-3. FASE 3: Kalkulasi risiko (Entry, SL, TP1, TP2, RR Ratio)
+Jalankan TOP-DOWN ANALYSIS sesuai system prompt v3.0:
+1. FASE 1: Baca struktur M15 → tentukan BIAS (BULLISH/BEARISH) atau RANGING
+2. FASE 2: Jika RANGING atau sesi tidak valid → output STANDBY
+3. FASE 3: Jika ada bias jelas → cari setup M5 (BoS retest / rejection wick / engulfing)
+4. FASE 4: Kalkulasi SL (maks 10 pip) dan TP (min RR 0.8)
 
-INGAT: Kamu WAJIB output ENTRY. Pilih arah terbaik berdasarkan bias H1.
-Jika tidak ada sinyal candle jelas, gunakan PRIORITAS 3 (fallback) — entry di level kunci searah bias.
-Direction HARUS sesuai bias_htf (BULLISH=BUY, BEARISH=SELL).
+INGAT:
+- STANDBY diperbolehkan jika kondisi tidak mendukung
+- SL TIDAK BOLEH melebihi 10 pip
+- Hanya entry di session London (07:00–10:00 UTC) atau NY (12:00–15:00 UTC)
+- Modal sangat terbatas ($30) — capital preservation > profit hunting
 
 Respond HANYA dengan JSON, tidak ada teks lain."""
 
@@ -297,20 +302,61 @@ Respond HANYA dengan JSON, tidak ada teks lain."""
         return str(dt)[:16] if dt else "?"
 
     def _downsample_to_h1(self, candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Downsample M15 candles ke H1 approximation (4 candle = 1 H1)."""
+        """Downsample M15 candles ke H1 dengan alignment ke boundary jam yang benar.
+
+        Grouping berdasarkan (year, month, day, hour) dari timestamp tiap candle,
+        sehingga H1 yang dihasilkan selalu mencerminkan 1 jam kalender yang benar
+        tanpa bergantung pada posisi candle pertama dalam array.
+
+        Args:
+            candles: list candle M15 dengan field 'time' berupa datetime atau string
+
+        Returns:
+            list candle H1, diurutkan ascending by time
+        """
         if len(candles) < 4:
             return candles
 
-        h1: list[dict[str, Any]] = []
-        for i in range(0, len(candles) - 3, 4):
-            chunk = candles[i:i + 4]
+        # Group candles by hour boundary
+        from collections import defaultdict
+        groups: dict[tuple, list[dict]] = defaultdict(list)
+
+        for candle in candles:
+            dt = candle.get("time")
+            if isinstance(dt, str):
+                try:
+                    from datetime import datetime as _dt
+                    dt = _dt.fromisoformat(dt.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    continue
+            if dt is None:
+                continue
+
+            # Key: (year, month, day, hour) — boundary jam UTC
+            hour_key = (dt.year, dt.month, dt.day, dt.hour)
+            groups[hour_key].append(candle)
+
+        h1: list[dict] = []
+        for hour_key in sorted(groups.keys()):
+            chunk = groups[hour_key]
+            if len(chunk) == 0:
+                continue
+
+            # Sort chunk by time untuk pastikan open = candle pertama, close = terakhir
+            chunk_sorted = sorted(
+                chunk,
+                key=lambda c: c.get("time") if isinstance(c.get("time"), str) else c.get("time").isoformat() if c.get("time") else "",
+            )
+
             h1.append({
-                "time": chunk[0].get("time"),
-                "open": float(chunk[0]["open"]),
-                "high": max(float(c["high"]) for c in chunk),
-                "low": min(float(c["low"]) for c in chunk),
-                "close": float(chunk[-1]["close"]),
+                "time": chunk_sorted[0].get("time"),   # open time = awal jam
+                "open": float(chunk_sorted[0]["open"]),
+                "high": max(float(c["high"]) for c in chunk_sorted),
+                "low": min(float(c["low"]) for c in chunk_sorted),
+                "close": float(chunk_sorted[-1]["close"]),
+                "tick_volume": sum(int(c.get("tick_volume", 0)) for c in chunk_sorted),
             })
+
         return h1
 
     @staticmethod
@@ -338,11 +384,35 @@ Respond HANYA dengan JSON, tidak ada teks lain."""
     ) -> dict[str, Any]:
         """Validate & normalize LLM response ke format standar.
 
-        v2.1: Decision selalu ENTRY. Jika LLM return STANDBY atau invalid,
-        generate fallback entry berdasarkan bias_htf.
+        v3.0: STANDBY diperbolehkan. ENTRY divalidasi seperti biasa.
         """
 
         decision = str(raw.get("decision", "ENTRY")).upper()
+
+        # v3.0: Handle STANDBY
+        if decision == "STANDBY":
+            return {
+                "decision": "STANDBY",
+                "direction": "NONE",
+                "entry_price": None,
+                "sl_price": None,
+                "tp1_price": None,
+                "tp2_price": None,
+                "lot_size": None,
+                "rr_ratio_t1": None,
+                "rr_ratio_t2": None,
+                "confidence": self._safe_int(raw.get("confidence"), 0),
+                "bias_htf": str(raw.get("bias_htf", "RANGING")).upper(),
+                "intraday_phase": raw.get("intraday_phase") or "CONSOLIDATION",
+                "reason": str(raw.get("reason", "Kondisi tidak mendukung entry"))[:300],
+                "invalidation": "N/A",
+                "risk_percent": 1.0,
+                "analyzed_at": now,
+                "session": session,
+                "atr": atr,
+            }
+
+        # Lanjut ke validasi ENTRY seperti biasa...
         direction = str(raw.get("direction", "")).upper()
         bias_htf = str(raw.get("bias_htf", "")).upper()
 

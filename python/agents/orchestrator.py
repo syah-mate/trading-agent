@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.mt5_client import MT5Client, detect_session, calculate_atr
-from core.openrouter_client import OpenRouterClient
+from core.openrouter_client import OpenRouterClient, DEFAULT_MODEL
 from core.mongo_client import MongoClient
 from agents.trading_agent import TradingAgent
 from agents.mt5_executor import MT5Executor
@@ -29,7 +29,7 @@ from config import (
 logger = logging.getLogger(__name__)
 
 # Jumlah candle baru sebelum menjalankan agent
-CANDLE_INTERVAL = 3
+CANDLE_INTERVAL = 1  # M5 scalp: cek setiap candle baru
 
 
 class Orchestrator:
@@ -75,7 +75,7 @@ class Orchestrator:
 
         # Load LLM model dari user config (terpusat dari /config)
         config = self._mongo.get_config()
-        llm_model = config.get("llm_model", "x-ai/grok-4.3")
+        llm_model = config.get("llm_model", DEFAULT_MODEL)
         self._llm.set_model(llm_model)
         logger.info("Orchestrator: LLM model dari config = %s", llm_model)
 
@@ -92,6 +92,12 @@ class Orchestrator:
                         continue
 
                     await self._wait_for_candle_interval()
+
+                    # Session filter: hanya entry di London & NY open
+                    if not self._is_valid_session():
+                        logger.info("Orchestrator: bukan sesi aktif — skip cycle")
+                        continue
+
                     await self.run_cycle()
                 except Exception as e:
                     logger.error("Orchestrator cycle error: %s", e, exc_info=True)
@@ -188,63 +194,82 @@ class Orchestrator:
                 risk_percent=risk_percent,
             )
 
-            # --- v2.1: Selalu isi null fields dengan kalkulasi rule-based ---
-            agent_result = self._fill_missing_prices(
-                agent_result, candles, current_price, atr, balance, risk_percent,
-            )
+            # v3.0: Cek apakah agent memutuskan STANDBY
+            decision = agent_result.get("decision", "ENTRY")
 
-            # Log signal
-            self._mongo.insert_log({
-                "type": "agent_decision",
-                "cycle_at": cycle_start,
-                "session": session,
-                "decision": agent_result,
-            })
+            if decision == "STANDBY":
+                reason = agent_result.get("reason", "")
+                logger.info("Orchestrator: agent STANDBY — %s", reason)
 
-            # Simpan signal ke MongoDB
-            self._mongo.insert_signal(agent_result)
+                self._mongo.insert_log({
+                    "type": "standby",
+                    "cycle_at": cycle_start,
+                    "session": session,
+                    "reason": reason,
+                })
 
-            # --- v2.1: Selalu eksekusi trade ---
-            direction = agent_result.get("direction")
-            confidence = agent_result.get("confidence", 0)
-            logger.info(
-                ">>> OPENING %s confidence=%d (always-in) <<<", direction, confidence,
-            )
-
-            trade = self._executor.open_position(agent_result)
-
-            if "error" in trade:
-                logger.error("Eksekusi trade gagal: %s", trade["error"])
                 cycle_result = {
-                    "status": "execution_failed",
-                    "error": trade["error"],
+                    "status": "standby",
+                    "reason": reason,
                 }
             else:
-                # Simpan trade ke MongoDB
-                trade["symbol"] = SYMBOL
-                trade["confidence"] = confidence
-                trade["entry_reason"] = agent_result.get("reason", "")
-                trade["session"] = session
-                trade["bias_htf"] = agent_result.get("bias_htf")
-                trade["rr_ratio_t1"] = agent_result.get("rr_ratio_t1")
-                trade["rr_ratio_t2"] = agent_result.get("rr_ratio_t2")
-                trade["tp2_price"] = agent_result.get("tp2_price")
-                self._mongo.insert_trade(trade)
-
-                cycle_result = {
-                    "status": "trade_opened",
-                    "ticket": trade.get("ticket"),
-                    "direction": trade.get("direction"),
-                    "confidence": confidence,
-                }
-
-                logger.info(
-                    ">>> TRADE OPENED: ticket=%d %s entry=%.4f sl=%.4f tp=%.4f <<<",
-                    trade.get("ticket"), direction,
-                    trade.get("entry_price"),
-                    trade.get("sl"),
-                    trade.get("tp"),
+                # ENTRY: isi null prices jika perlu
+                agent_result = self._fill_missing_prices(
+                    agent_result, candles, current_price, atr, balance, risk_percent,
                 )
+
+                # Log signal
+                self._mongo.insert_log({
+                    "type": "agent_decision",
+                    "cycle_at": cycle_start,
+                    "session": session,
+                    "decision": agent_result,
+                })
+
+                # Simpan signal ke MongoDB
+                self._mongo.insert_signal(agent_result)
+
+                # v3.0: Eksekusi trade (hanya untuk ENTRY)
+                direction = agent_result.get("direction")
+                confidence = agent_result.get("confidence", 0)
+                logger.info(
+                    ">>> OPENING %s confidence=%d <<<", direction, confidence,
+                )
+
+                trade = self._executor.open_position(agent_result)
+
+                if "error" in trade:
+                    logger.error("Eksekusi trade gagal: %s", trade["error"])
+                    cycle_result = {
+                        "status": "execution_failed",
+                        "error": trade["error"],
+                    }
+                else:
+                    # Simpan trade ke MongoDB
+                    trade["symbol"] = SYMBOL
+                    trade["confidence"] = confidence
+                    trade["entry_reason"] = agent_result.get("reason", "")
+                    trade["session"] = session
+                    trade["bias_htf"] = agent_result.get("bias_htf")
+                    trade["rr_ratio_t1"] = agent_result.get("rr_ratio_t1")
+                    trade["rr_ratio_t2"] = agent_result.get("rr_ratio_t2")
+                    trade["tp2_price"] = agent_result.get("tp2_price")
+                    self._mongo.insert_trade(trade)
+
+                    cycle_result = {
+                        "status": "trade_opened",
+                        "ticket": trade.get("ticket"),
+                        "direction": trade.get("direction"),
+                        "confidence": confidence,
+                    }
+
+                    logger.info(
+                        ">>> TRADE OPENED: ticket=%d %s entry=%.4f sl=%.4f tp=%.4f <<<",
+                        trade.get("ticket"), direction,
+                        trade.get("entry_price"),
+                        trade.get("sl"),
+                        trade.get("tp"),
+                    )
 
         # Update status
         self._mongo.insert_log({
@@ -254,8 +279,42 @@ class Orchestrator:
             "result": cycle_result,
         })
 
+        # Update last_cycle_at di config (single source of truth)
+        self._mongo.upsert_config({"last_cycle_at": cycle_start})
+
         logger.info("--- Cycle end: %s ---", cycle_result.get("status"))
         return cycle_result
+
+    # ------------------------------------------------------------------
+    # Session Validator (v3.0)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_valid_session() -> bool:
+        """Cek apakah saat ini adalah sesi London atau NY (WIB = UTC+7).
+
+        London Open: 14:00–17:00 WIB = 07:00–10:00 UTC
+        New York Open: 19:00–22:00 WIB = 12:00–15:00 UTC
+
+        Returns:
+            True jika sesi valid untuk entry
+        """
+        from datetime import datetime, timezone as tz
+        now_utc = datetime.now(tz.utc)
+        hour_utc = now_utc.hour
+
+        is_london = 7 <= hour_utc < 10
+        is_newyork = 12 <= hour_utc < 15
+
+        if is_london:
+            logger.info("Session: London Open ✅ (boleh entry)")
+            return True
+        elif is_newyork:
+            logger.info("Session: New York Open ✅ (boleh entry)")
+            return True
+        else:
+            logger.info("Session: Di luar sesi aktif (Asia/transisi) — SKIP entry")
+            return False
 
     # ------------------------------------------------------------------
     # Wait for candle interval

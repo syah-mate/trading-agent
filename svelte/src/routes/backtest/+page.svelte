@@ -1,5 +1,5 @@
 <script>
-	import { fetchBacktestRuns, startBacktest, fetchBacktestProgress, stopBacktest, fetchBacktestRun } from '$lib/api';
+	import { fetchBacktestRuns, startBacktest, fetchBacktestProgress, stopBacktest, fetchBacktestRun, fetchBacktestStatus } from '$lib/api';
 
 	let runs = $state([]);
 	let loading = $state(true);
@@ -18,6 +18,15 @@
 	let progress = $state(null);
 	let pollingInterval = $state(null);
 	let stopping = $state(false);
+
+	// Backtest mutex — cek apakah ada backtest lain yang sedang berjalan
+	let backtestStatus = $state({ is_running: false, current_run_id: null });
+
+	async function checkBacktestStatus() {
+		try {
+			backtestStatus = await fetchBacktestStatus();
+		} catch (e) { /* ignore - API might not be ready */ }
+	}
 
 	// Detail view
 	let selectedRun = $state(null);
@@ -133,6 +142,13 @@
 
 	$effect(() => { loadRuns(); });
 
+	// Poll backtest status setiap 10 detik untuk disable tombol Start jika ada backtest lain
+	$effect(() => {
+		checkBacktestStatus();
+		const interval = setInterval(checkBacktestStatus, 10_000);
+		return () => clearInterval(interval);
+	});
+
 	function formatCurrency(val) {
 		if (val == null) return '$0.00';
 		return '$' + Number(val).toLocaleString('en-US', { minimumFractionDigits: 2 });
@@ -191,10 +207,11 @@
 		<div class="flex items-end gap-2">
 			<button
 				onclick={runBacktest}
-				disabled={runningId !== null}
+				disabled={runningId !== null || backtestStatus.is_running}
 				class="flex-1 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm font-medium transition-colors"
+				title={backtestStatus.is_running && !runningId ? `Backtest sedang berjalan (run_id=${backtestStatus.current_run_id})` : ''}
 			>
-				{runningId ? 'Running...' : '▶ Run Backtest'}
+				{runningId ? 'Running...' : backtestStatus.is_running ? '⏳ Backtest Active...' : '▶ Run Backtest'}
 			</button>
 			{#if runningId && !stopping}
 				<button

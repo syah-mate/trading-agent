@@ -51,12 +51,43 @@ class MongoClient:
             self._client.admin.command("ping")
             self._db = self._client[self._db_name]
             logger.info("MongoClient: terkoneksi ke %s / %s", self._uri, self._db_name)
+            # Pastikan indexes ada
+            self._ensure_indexes()
             return True
         except PyMongoError as e:
             logger.error("MongoClient: gagal konek — %s", e)
             self._client = None
             self._db = None
             return False
+
+    def _ensure_indexes(self) -> None:
+        """Buat indexes yang diperlukan jika belum ada.
+
+        Dipanggil otomatis setelah koneksi berhasil.
+        Idempotent — aman dipanggil berkali-kali (MongoDB tidak duplikasi index yang sudah ada).
+        """
+        try:
+            # trades: query by ticket (unique), sort by opened_at
+            self._trades.create_index("ticket", unique=True, sparse=True)
+            self._trades.create_index([("opened_at", -1)])
+
+            # signals: sort by analyzed_at (paling sering dipakai di dashboard)
+            self._signals.create_index([("analyzed_at", -1)])
+            self._signals.create_index("session")  # filter by session
+
+            # agent_logs: filter by type, sort by created_at
+            self._agent_logs.create_index("type")
+            self._agent_logs.create_index([("created_at", -1)])
+            # compound index untuk query: type + created_at (paling sering)
+            self._agent_logs.create_index([("type", 1), ("created_at", -1)])
+
+            # backtest_runs: sort by created_at
+            self._backtest_runs.create_index([("created_at", -1)])
+            self._backtest_runs.create_index("status")  # filter by status
+
+            logger.info("MongoClient: indexes berhasil dibuat/verified")
+        except Exception as e:
+            logger.warning("MongoClient: gagal buat index — %s", e)
 
     def disconnect(self) -> None:
         """Tutup koneksi MongoDB."""
@@ -118,11 +149,11 @@ class MongoClient:
         limit: int = 50,
         skip: int = 0,
     ) -> list[dict[str, Any]]:
-        """Ambil signals dengan filter, sort by created_at DESC."""
+        """Ambil signals dengan filter, sort by analyzed_at DESC."""
         filter = filter or {}
         cursor = (
             self._signals.find(filter)
-            .sort("created_at", -1)
+            .sort("analyzed_at", -1)
             .skip(skip)
             .limit(limit)
         )

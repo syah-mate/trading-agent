@@ -16,7 +16,9 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "x-ai/grok-4.3"
+# Satu default yang konsisten dengan config.py
+# Override via MongoDB config (llm_model) atau .env (OPENROUTER_MODEL)
+DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
 
 
 class OpenRouterClient:

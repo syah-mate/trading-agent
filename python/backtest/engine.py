@@ -17,7 +17,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from core.mt5_client import MT5Client, detect_session, calculate_atr
-from core.openrouter_client import OpenRouterClient
+from core.openrouter_client import OpenRouterClient, DEFAULT_MODEL
 from core.mongo_client import MongoClient
 from agents.trading_agent import TradingAgent
 from backtest.reporter import generate_stats
@@ -78,7 +78,7 @@ class BacktestEngine:
 
         # Load LLM model dari user config (terpusat dari /config)
         config = self._mongo.get_config()
-        llm_model = config.get("llm_model", "x-ai/grok-4.3")
+        llm_model = config.get("llm_model", DEFAULT_MODEL)
         self._llm.set_model(llm_model)
         logger.info("Backtest: LLM model dari config = %s", llm_model)
 

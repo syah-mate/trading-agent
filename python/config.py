@@ -19,6 +19,8 @@ MT5_SERVER: str = os.getenv("MT5_SERVER", "")
 # OpenRouter
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+# Default model — harus konsisten dengan DEFAULT_MODEL di core/openrouter_client.py
+# Override via MongoDB config (llm_model) atau .env (OPENROUTER_MODEL)
 OPENROUTER_MODEL: str = os.getenv(
     "OPENROUTER_MODEL", "google/gemini-2.5-flash-lite"
 )
@@ -33,7 +35,7 @@ MONGO_DB_NAME: str = os.getenv("MONGO_DB_NAME", "trading_agent")
 # Trading Parameters
 # ---------------------------------------------------------------------------
 SYMBOL: str = os.getenv("SYMBOL", "XAUUSD")
-TIMEFRAME: str = os.getenv("TIMEFRAME", "M15")
+TIMEFRAME: str = os.getenv("TIMEFRAME", "M5")
 LOT_SIZE: float = float(os.getenv("LOT_SIZE", "0.01"))
 MAX_DAILY_LOSS: float = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
 CONFIDENCE_THRESHOLD: int = int(os.getenv("CONFIDENCE_THRESHOLD", "70"))
@@ -42,4 +44,12 @@ CONFIDENCE_THRESHOLD: int = int(os.getenv("CONFIDENCE_THRESHOLD", "70"))
 # Orchestrator Settings (v2.0)
 # ---------------------------------------------------------------------------
 CANDLES_COUNT: int = 200  # Jumlah candle untuk analisis
-CANDLE_INTERVAL: int = 3  # Jalankan agent setiap N candle baru
+CANDLE_INTERVAL: int = 1  # M5 scalp: cek setiap candle baru
+
+# ---------------------------------------------------------------------------
+# M5 Scalp Strategy Settings (v3.0)
+# ---------------------------------------------------------------------------
+MAX_SL_PIPS: float = 10.0         # Maksimum SL = 10 pip untuk modal kecil
+MIN_RR_RATIO: float = 0.8         # Minimum RR sebelum entry
+MAX_TRADES_PER_SESSION: int = 2   # Maksimum 2 trade per sesi
+MAX_DAILY_LOSS_PCT: float = 10.0  # Stop trading jika daily loss ≥ 10% modal
