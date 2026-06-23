@@ -23,15 +23,63 @@ from dotenv import load_dotenv
 from core.mt5_client import MT5Client, detect_session, calculate_atr
 from core.openrouter_client import OpenRouterClient, DEFAULT_MODEL
 from core.mongo_client import MongoClient
+from core.sr_detector import SRDetector
 from agents.trading_agent import TradingAgent
 from backtest.reporter import generate_stats
 
 logger = logging.getLogger(__name__)
 
-EVAL_INTERVAL = 1  # Evaluasi setiap 1 candle M5 (sinkron dengan live trading)
-
 # Session yang valid untuk entry (sinkron dengan orchestrator._is_valid_session)
 VALID_SESSIONS = {"London", "New York", "Overlap"}
+
+
+def _downsample_m5_to_m15(candles: list[dict]) -> list[dict]:
+    """Downsample candle M5 ke M15 berdasarkan boundary 15 menit.
+
+    Salinan dari TradingAgent._downsample_to_m15 — diekstrak sebagai
+    standalone function agar bisa dipakai di backtest tanpa import agent.
+    """
+    from collections import defaultdict
+    from datetime import datetime as _dt
+
+    if len(candles) < 3:
+        return candles
+
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+
+    for candle in candles:
+        dt = candle.get("time")
+        if isinstance(dt, str):
+            try:
+                dt = _dt.fromisoformat(dt.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+        if dt is None:
+            continue
+
+        slot_minute = (dt.minute // 15) * 15
+        key = (dt.year, dt.month, dt.day, dt.hour, slot_minute)
+        groups[key].append(candle)
+
+    m15: list[dict] = []
+    for key in sorted(groups.keys()):
+        chunk = groups[key]
+        if not chunk:
+            continue
+        chunk_sorted = sorted(
+            chunk,
+            key=lambda c: c["time"].isoformat() if hasattr(c.get("time"), "isoformat") else str(c.get("time", "")),
+        )
+        m15.append({
+            "time": chunk_sorted[0]["time"],
+            "open": float(chunk_sorted[0]["open"]),
+            "high": max(float(c["high"]) for c in chunk_sorted),
+            "low": min(float(c["low"]) for c in chunk_sorted),
+            "close": float(chunk_sorted[-1]["close"]),
+            "tick_volume": sum(int(c.get("tick_volume", 0)) for c in chunk_sorted),
+        })
+
+    return m15
 
 
 class BacktestEngine:
@@ -128,7 +176,10 @@ class BacktestEngine:
             virtual_position: dict[str, Any] | None = None
             equity_curve: list[dict[str, Any]] = []
             current_balance = initial_capital
-            candles_since_eval = 0
+
+            # S/R Detector — sinkron dengan live trading
+            sr_detector = SRDetector()
+            SR_WARMUP_CANDLES = 50  # butuh minimal 50 candle M15 untuk inisialisasi S/R levels
 
             # Daily loss tracking
             daily_pnl: dict[str, float] = {}       # key: "YYYY-MM-DD", value: total PnL hari itu
@@ -205,61 +256,101 @@ class BacktestEngine:
                             })
                             return
                         virtual_position = None
-                        candles_since_eval = 0
                     else:
                         unrealized = self._calc_unrealized_pnl(virtual_position, float(current_candle["close"]))
                         equity_curve.append({"candle_index": i, "equity": current_balance + unrealized, "event": "hold"})
                 else:
-                    candles_since_eval += 1
-                    if candles_since_eval >= EVAL_INTERVAL:
-                        candles_since_eval = 0
+                    # ── SESSION FILTER ──
+                    if session not in VALID_SESSIONS:
+                        equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_session"})
+                        continue
 
-                        # ── SESSION FILTER (sinkron dengan orchestrator._is_valid_session) ──
-                        if session not in VALID_SESSIONS:
-                            # Bukan London/NY/Overlap — skip, tidak panggil LLM
-                            equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_session"})
-                            continue
+                    # ── DAILY LOSS GUARD ──
+                    candle_time = current_candle.get("time")
+                    date_key = candle_time.strftime("%Y-%m-%d") if isinstance(candle_time, datetime) else str(candle_time)[:10]
+                    today_pnl = daily_pnl.get(date_key, 0.0)
+                    daily_loss_limit = -(initial_capital * max_daily_loss_pct / 100.0)
 
-                        # ── DAILY LOSS GUARD ──
-                        candle_time = current_candle.get("time")
-                        date_key = candle_time.strftime("%Y-%m-%d") if isinstance(candle_time, datetime) else str(candle_time)[:10]
-                        today_pnl = daily_pnl.get(date_key, 0.0)
-                        daily_loss_limit = -(initial_capital * max_daily_loss_pct / 100.0)
+                    if today_pnl <= daily_loss_limit:
+                        equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_daily_loss"})
+                        continue
 
-                        if today_pnl <= daily_loss_limit:
-                            logger.info("Backtest: daily loss limit reached on %s (pnl=%.2f, limit=%.2f) — skip", date_key, today_pnl, daily_loss_limit)
-                            equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_daily_loss"})
-                            continue
+                    # ── MAX TRADE PER SESSION GUARD ──
+                    session_day_key = f"{date_key}:{session}"
+                    trades_this_session = daily_trade_count.get(session_day_key, 0)
+                    if trades_this_session >= 2:
+                        equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_max_trades"})
+                        continue
 
-                        # ── MAX TRADE PER SESSION GUARD (max 2 trade per sesi per hari) ──
-                        session_day_key = f"{date_key}:{session}"
-                        trades_this_session = daily_trade_count.get(session_day_key, 0)
-                        if trades_this_session >= 2:
-                            equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_max_trades"})
-                            continue
+                    # ── UPDATE S/R DETECTOR (setiap candle, gratis — tidak pakai AI) ──
+                    if i >= SR_WARMUP_CANDLES:
+                        m15_candles = _downsample_m5_to_m15(candles_window)
+                        sr_detector.update(m15_candles)
 
-                        try:
-                            atr = calculate_atr(candles_window, period=14)
-                            agent_result = await self._agent.analyze(
-                                candles=candles_window[-200:],  # ← batasi 200 candle untuk hemat token
-                                position=None,
-                                session=session, atr=atr, symbol=symbol,
-                                balance=current_balance, risk_percent=1.0,
+                    # ── CEK APAKAH HARGA MENYENTUH S/R FRESH ──
+                    current_price_close = float(current_candle["close"])
+                    current_price_high  = float(current_candle["high"])
+                    current_price_low   = float(current_candle["low"])
+
+                    touched_by_high = sr_detector.check_touch(current_price_high, candle_time=candle_time)
+                    touched_by_low  = sr_detector.check_touch(current_price_low,  candle_time=candle_time)
+                    all_touched = touched_by_high + touched_by_low
+
+                    if not all_touched:
+                        equity_curve.append({"candle_index": i, "equity": current_balance, "event": "scan"})
+                        continue
+
+                    # ── S/R DISENTUH → CALL AI UNTUK VALIDASI ──
+                    sr_level = min(all_touched, key=lambda lv: abs(lv.price - current_price_close))
+
+                    logger.info(
+                        "Backtest: TOUCH candle=%d price_range=[%.4f,%.4f] level=%.4f (%s) — calling AI...",
+                        i, current_price_low, current_price_high, sr_level.price, sr_level.kind,
+                    )
+
+                    try:
+                        atr = calculate_atr(candles_window, period=14)
+                        agent_result = await self._agent.analyze(
+                            candles=candles_window,
+                            position=None,
+                            session=session,
+                            atr=atr,
+                            symbol=symbol,
+                            balance=current_balance,
+                            risk_percent=1.0,
+                            sr_level=sr_level.to_dict(),
+                        )
+
+                        decision = agent_result.get("decision", "STANDBY")
+                        confidence = agent_result.get("confidence", 0)
+
+                        if decision == "ENTRY" and confidence >= 60:
+                            direction = "BUY" if sr_level.kind == "support" else "SELL"
+                            agent_result["direction"] = direction
+                            agent_result["entry_price"] = current_price_close
+
+                            virtual_position = self._create_virtual_position(agent_result, current_candle, i)
+                            equity_curve.append({
+                                "candle_index": i,
+                                "equity": current_balance,
+                                "event": f"open_{direction}",
+                            })
+                            logger.info(
+                                "Backtest: OPEN %s at candle %d price=%.4f conf=%d sr_level=%.4f (%s)",
+                                direction, i, current_price_close, confidence,
+                                sr_level.price, sr_level.kind,
                             )
-                            if agent_result.get("decision") == "ENTRY" and agent_result.get("confidence", 0) >= 60:
-                                virtual_position = self._create_virtual_position(agent_result, current_candle, i)
-                                equity_curve.append({"candle_index": i, "equity": current_balance, "event": f"open_{agent_result.get('direction', 'N/A')}"})
-                                logger.info(
-                                    "Backtest: OPEN %s at candle %d price=%.4f conf=%d session=%s",
-                                    agent_result.get("direction"), i, virtual_position["entry_price"],
-                                    agent_result.get("confidence", 0), session,
-                                )
-                                # Increment session trade counter
-                                daily_trade_count[session_day_key] = trades_this_session + 1
-                        except Exception as e:
-                            logger.error("Backtest agent error at candle %d: %s", i, e)
+                            daily_trade_count[session_day_key] = trades_this_session + 1
+                        else:
+                            logger.info(
+                                "Backtest: AI STANDBY at candle %d — %s",
+                                i, agent_result.get("reason", ""),
+                            )
+                            equity_curve.append({"candle_index": i, "equity": current_balance, "event": "standby"})
 
-                    equity_curve.append({"candle_index": i, "equity": current_balance, "event": "scan"})
+                    except Exception as e:
+                        logger.error("Backtest agent error at candle %d: %s", i, e)
+                        equity_curve.append({"candle_index": i, "equity": current_balance, "event": "error"})
 
             if virtual_position is not None:
                 virtual_position["closed_at_candle"] = total_candles - 1
@@ -355,20 +446,37 @@ class BacktestEngine:
 
     def _create_virtual_position(self, agent_result: dict[str, Any], candle: dict[str, Any], candle_idx: int) -> dict[str, Any]:
         direction = agent_result.get("direction")
-        entry_price = agent_result.get("entry_price") or float(candle["close"])
+        entry_price = float(agent_result.get("entry_price") or candle["close"])
+
+        # TP fixed $1 untuk 0.01 lot XAUUSD
+        # $1 = tp_distance × lot × 100 → tp_distance = 1.0 / (0.01 × 100) = 1.0
+        LOT = 0.01
+        tp_distance = 1.0 / (LOT * 100)  # = 1.0 dollar move
+        if direction == "BUY":
+            tp_price = round(entry_price + tp_distance, 5)
+        else:
+            tp_price = round(entry_price - tp_distance, 5)
+
+        sl_price = float(agent_result.get("sl_price", 0) or 0)
+        # Fallback SL jika AI tidak memberikan
+        if sl_price == 0:
+            atr = agent_result.get("atr", 0.5)
+            if direction == "BUY":
+                sl_price = round(entry_price - atr * 1.2, 5)
+            else:
+                sl_price = round(entry_price + atr * 1.2, 5)
+
         return {
             "direction": direction,
             "entry_price": float(entry_price),
-            "sl": float(agent_result.get("sl_price", 0) or 0),
-            "tp": float(agent_result.get("tp1_price", 0) or 0),
-            "tp2": float(tp2) if (tp2 := agent_result.get("tp2_price")) else None,
+            "sl": sl_price,
+            "tp": tp_price,
             "opened_at_candle": candle_idx,
             "opened_at": candle.get("time"),
             "entry_reason": agent_result.get("reason", ""),
             "bias_htf": agent_result.get("bias_htf"),
             "confidence": agent_result.get("confidence", 0),
             "rr_ratio_t1": agent_result.get("rr_ratio_t1"),
-            "rr_ratio_t2": agent_result.get("rr_ratio_t2"),
             "session": agent_result.get("session", "Other"),
             "volume": 0.01,
         }
