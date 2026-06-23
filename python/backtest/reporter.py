@@ -12,6 +12,7 @@ Output:
 """
 
 import logging
+from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,8 @@ def generate_stats(
             "equity_curve": equity_curve or [],
             "best_trade": {},
             "worst_trade": {},
+            "best_trades": [],
+            "worst_trades": [],
             "trades_by_session": {},
             "trades_by_direction": {},
             "total_pnl": 0.0,
@@ -78,10 +81,12 @@ def generate_stats(
     avg_win_rr = _avg_rr(winning)
     avg_loss_rr = _avg_rr(losing)
 
-    # Best / Worst trade
+    # Best / Worst trades (top 5)
     sorted_by_pnl = sorted(trades, key=lambda t: t.get("pnl", 0), reverse=True)
     best_trade = _summarize_trade(sorted_by_pnl[0]) if sorted_by_pnl else {}
     worst_trade = _summarize_trade(sorted_by_pnl[-1]) if sorted_by_pnl else {}
+    best_trades = [_summarize_trade(t) for t in sorted_by_pnl[:5]]
+    worst_trades = [_summarize_trade(t) for t in sorted_by_pnl[-5:][::-1]]
 
     # Max drawdown from equity curve
     max_dd, max_dd_duration = _calculate_drawdown(
@@ -118,6 +123,8 @@ def generate_stats(
         "equity_curve": equity_curve or [],
         "best_trade": best_trade,
         "worst_trade": worst_trade,
+        "best_trades": best_trades,
+        "worst_trades": worst_trades,
         "trades_by_session": trades_by_session,
         "trades_by_direction": trades_by_direction,
     }
@@ -179,15 +186,33 @@ def _calculate_drawdown(
 
 
 def _summarize_trade(trade: dict[str, Any]) -> dict[str, Any]:
-    """Ringkasan 1 trade untuk best/worst."""
+    """Ringkasan 1 trade untuk best/worst dan trade list."""
     return {
         "direction": trade.get("direction", ""),
         "entry_price": trade.get("entry_price", 0),
         "exit_price": trade.get("exit_price", 0),
+        "sl": trade.get("sl", 0),
+        "tp": trade.get("tp", 0),
         "pnl": round(trade.get("pnl", 0), 2),
         "exit_reason": trade.get("exit_reason", ""),
         "candles_held": (
             trade.get("closed_at_candle", 0) - trade.get("opened_at_candle", 0)
         ),
         "session": trade.get("session", ""),
+        "entry_time": _iso(trade.get("opened_at")),
+        "exit_time": _iso(trade.get("exit_time")),
+        "confidence": trade.get("confidence", 0),
+        "rr_ratio_t1": trade.get("rr_ratio_t1"),
+        "rr_ratio_t2": trade.get("rr_ratio_t2"),
+        "bias_htf": trade.get("bias_htf", ""),
+        "entry_reason": trade.get("entry_reason", ""),
     }
+
+
+def _iso(val: Any) -> str:
+    """Convert datetime ke ISO string, atau return ''."""
+    if val is None:
+        return ""
+    if isinstance(val, datetime):
+        return val.isoformat()
+    return str(val)

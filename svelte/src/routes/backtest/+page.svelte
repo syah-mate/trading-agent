@@ -1,5 +1,5 @@
 <script>
-	import { fetchBacktestRuns, startBacktest, fetchBacktestProgress, stopBacktest } from '$lib/api';
+	import { fetchBacktestRuns, startBacktest, fetchBacktestProgress, stopBacktest, fetchBacktestRun } from '$lib/api';
 
 	let runs = $state([]);
 	let loading = $state(true);
@@ -22,15 +22,30 @@
 	// Detail view
 	let selectedRun = $state(null);
 	let showDetail = $state(false);
+	let detailLoading = $state(false);
+	let selectedTradeIndex = $state(null); // expanded trade row index
 
-	function selectRun(run) {
-		selectedRun = run;
+	async function selectRun(run) {
 		showDetail = true;
+		detailLoading = true;
+		selectedTradeIndex = null;
+		try {
+			selectedRun = await fetchBacktestRun(run._id);
+		} catch (e) {
+			selectedRun = run; // fallback ke data dari list
+		} finally {
+			detailLoading = false;
+		}
 	}
 
 	function closeDetail() {
 		showDetail = false;
 		selectedRun = null;
+		selectedTradeIndex = null;
+	}
+
+	function toggleTradeDetail(idx) {
+		selectedTradeIndex = selectedTradeIndex === idx ? null : idx;
 	}
 
 	function drawEquityCurve(equityCurve, initialBalance) {
@@ -298,10 +313,16 @@
 			</div>
 
 			<div class="flex items-center gap-4 mb-6 text-sm">
-				<span class="px-2 py-0.5 rounded text-xs {selectedRun.status === 'completed' ? 'bg-emerald-900/30 text-emerald-300' : 'bg-red-900/30 text-red-300'}">
+				<span class="px-2 py-0.5 rounded text-xs {selectedRun.status === 'completed' ? 'bg-emerald-900/30 text-emerald-300' : selectedRun.status === 'error' ? 'bg-red-900/30 text-red-300' : selectedRun.status === 'cancelled' ? 'bg-yellow-900/30 text-yellow-300' : 'bg-blue-900/30 text-blue-300'}">
 					{selectedRun.status}
 				</span>
+				{#if selectedRun.margin_call}
+					<span class="px-2 py-0.5 rounded text-xs bg-red-900/40 text-red-400 font-medium">⚠ Margin Call</span>
+				{/if}
 				<span class="text-gray-500">{formatDateTime(selectedRun.created_at)}</span>
+				{#if detailLoading}
+					<span class="text-gray-400 animate-pulse">Loading...</span>
+				{/if}
 			</div>
 
 			{#if selectedRun.stats}
@@ -375,6 +396,110 @@
 						/>
 					</svg>
 				{/if}
+			{/if}
+
+			<!-- Trade History Table -->
+			{#if selectedRun.trades?.length}
+				<h3 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 mt-6">
+					Trade History ({selectedRun.trades.length} trades)
+				</h3>
+				{@const tradesWithIndex = selectedRun.trades.map((t, i) => ({ ...t, _idx: i }))}
+				<div class="overflow-x-auto">
+					<table class="w-full text-xs">
+						<thead>
+							<tr class="text-gray-500 border-b border-gray-800">
+								<th class="text-left py-2 px-1">#</th>
+								<th class="text-left py-2 px-1">Dir</th>
+								<th class="text-right py-2 px-1">Entry</th>
+								<th class="text-right py-2 px-1">SL</th>
+								<th class="text-right py-2 px-1">TP</th>
+								<th class="text-right py-2 px-1">Exit</th>
+								<th class="text-center py-2 px-1">Reason</th>
+								<th class="text-right py-2 px-1">P&L</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each tradesWithIndex as trade}
+								{@const isExpanded = selectedTradeIndex === trade._idx}
+								<tr
+									onclick={() => toggleTradeDetail(trade._idx)}
+									class="border-b border-gray-800/50 cursor-pointer hover:bg-gray-800/50 transition-colors {isExpanded ? 'bg-gray-800/70' : ''}"
+								>
+									<td class="py-2 px-1 text-gray-500">{trade._idx + 1}</td>
+									<td class="py-2 px-1">
+										<span class="px-1.5 py-0.5 rounded text-xs font-medium {trade.direction === 'BUY' ? 'bg-emerald-900/30 text-emerald-300' : 'bg-red-900/30 text-red-300'}">
+											{trade.direction || '—'}
+										</span>
+									</td>
+									<td class="py-2 px-1 text-right font-mono">{trade.entry_price?.toFixed(4) || '—'}</td>
+									<td class="py-2 px-1 text-right font-mono text-red-400">{trade.sl > 0 ? trade.sl.toFixed(4) : '—'}</td>
+									<td class="py-2 px-1 text-right font-mono text-emerald-400">{trade.tp > 0 ? trade.tp.toFixed(4) : '—'}</td>
+									<td class="py-2 px-1 text-right font-mono">{trade.exit_price?.toFixed(4) || '—'}</td>
+									<td class="py-2 px-1 text-center">
+										<span class="px-1.5 py-0.5 rounded text-xs {trade.exit_reason === 'tp_hit' ? 'bg-emerald-900/30 text-emerald-300' : trade.exit_reason === 'sl_hit' ? 'bg-red-900/30 text-red-300' : 'bg-gray-800 text-gray-400'}">
+											{trade.exit_reason === 'tp_hit' ? '✅ TP' : trade.exit_reason === 'sl_hit' ? '❌ SL' : trade.exit_reason || '—'}
+										</span>
+									</td>
+									<td class="py-2 px-1 text-right font-mono font-medium {trade.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">
+										{formatCurrency(trade.pnl)}
+									</td>
+								</tr>
+								{#if isExpanded}
+									<tr class="bg-gray-800/40">
+										<td colspan="8" class="py-3 px-4">
+											<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+												<div>
+													<span class="text-gray-500">Opened at</span>
+													<div class="text-white mt-0.5">{formatDateTime(trade.opened_at) || '—'}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">Closed at</span>
+													<div class="text-white mt-0.5">{formatDateTime(trade.exit_time) || formatDateTime(trade.closed_at) || '—'}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">Candles Held</span>
+													<div class="text-white mt-0.5">{trade.closed_at_candle != null && trade.opened_at_candle != null ? trade.closed_at_candle - trade.opened_at_candle : '—'}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">Confidence</span>
+													<div class="text-white mt-0.5">{trade.confidence ? trade.confidence + '%' : '—'}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">R:R (T1)</span>
+													<div class="text-white mt-0.5">{trade.rr_ratio_t1 ? '1:' + Number(trade.rr_ratio_t1).toFixed(2) : '—'}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">R:R (T2)</span>
+													<div class="text-white mt-0.5">{trade.rr_ratio_t2 ? '1:' + Number(trade.rr_ratio_t2).toFixed(2) : '—'}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">Session</span>
+													<div class="text-white mt-0.5">{trade.session || '—'}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">Bias HTF</span>
+													<div class="text-white mt-0.5">{trade.bias_htf || '—'}</div>
+												</div>
+												<div class="col-span-2">
+													<span class="text-gray-500">Entry Reason</span>
+													<div class="text-white mt-0.5 max-w-md leading-relaxed">{trade.entry_reason || '—'}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">P&L</span>
+													<div class="font-bold mt-0.5 {trade.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">{formatCurrency(trade.pnl)}</div>
+												</div>
+												<div>
+													<span class="text-gray-500">Balance After</span>
+													<div class="text-white mt-0.5">{trade.balance_after ? formatCurrency(trade.balance_after) : '—'}</div>
+												</div>
+											</div>
+										</td>
+									</tr>
+								{/if}
+							{/each}
+						</tbody>
+					</table>
+				</div>
 			{/if}
 
 			<!-- Best / Worst Trades -->
