@@ -1,11 +1,15 @@
 """
-Backtest Engine v2.0 — Single Agent Mode
+Backtest Engine v3.0 — Sinkron dengan Live Trading
 
-Menggunakan TradingAgent yang sama dengan live trading.
-Setiap 3 candle → evaluasi sinyal via LLM.
-Tidak ada position monitoring (menunggu SL/TP saja).
+Menggunakan TradingAgent & rules yang SAMA dengan live trading:
+- Timeframe: M5 (default)
+- Session filter: hanya London, New York, Overlap
+- Eval interval: setiap 1 candle M5
+- Daily loss limit: max -10% per hari
+- Max 2 trade per sesi per hari
+- Candle window: 200 candle terakhir (hemat token LLM)
 
-Support: days_back (10, 20, 30, 60, 90, 180) dan months_back (1-6).
+Support: days_back dan months_back.
 """
 
 import asyncio
@@ -24,11 +28,21 @@ from backtest.reporter import generate_stats
 
 logger = logging.getLogger(__name__)
 
-EVAL_INTERVAL = 3  # Evaluasi setiap N candle
+EVAL_INTERVAL = 1  # Evaluasi setiap 1 candle M5 (sinkron dengan live trading)
+
+# Session yang valid untuk entry (sinkron dengan orchestrator._is_valid_session)
+VALID_SESSIONS = {"London", "New York", "Overlap"}
 
 
 class BacktestEngine:
-    """Backtest engine v2.0 — single agent, 3-candle interval."""
+    """Backtest engine v3.0 — single agent, sinkron dengan live trading.
+
+    Perubahan dari v2.0:
+    - Timeframe default M5 (bukan M15)
+    - Session filter aktif (hanya London, NY, Overlap)
+    - Eval interval = 1 candle (sinkron dengan live)
+    - Daily loss limit enforcement
+    """
 
     def __init__(self) -> None:
         self._mt5 = MT5Client()
@@ -42,7 +56,7 @@ class BacktestEngine:
         symbol: str = "XAUUSD",
         months_back: int | None = None,
         days_back: int | None = None,
-        timeframe: str = "M15",
+        timeframe: str = "M5",        # ← default M5, sinkron dengan live
         initial_capital: float = 10000.0,
     ) -> None:
         """Jalankan backtest.
@@ -52,7 +66,7 @@ class BacktestEngine:
             symbol: simbol trading
             months_back: berapa bulan ke belakang (prioritas)
             days_back: berapa hari ke belakang (jika months_back=None)
-            timeframe: timeframe candle
+            timeframe: timeframe candle (default M5)
             initial_capital: modal awal dalam USD (default $10,000)
         """
         if months_back is not None and months_back > 0:
@@ -66,7 +80,7 @@ class BacktestEngine:
             total_days = 180
 
         logger.info("=" * 60)
-        logger.info("Backtest v2.0: run_id=%s symbol=%s period=%s", run_id, symbol, period_label)
+        logger.info("Backtest v3.0: run_id=%s symbol=%s period=%s", run_id, symbol, period_label)
         logger.info("=" * 60)
 
         if not self._mt5.connect():
@@ -81,6 +95,16 @@ class BacktestEngine:
         llm_model = config.get("llm_model", DEFAULT_MODEL)
         self._llm.set_model(llm_model)
         logger.info("Backtest: LLM model dari config = %s", llm_model)
+
+        # Baca timeframe dari MongoDB config jika tidak di-override caller
+        # Priority: parameter caller → MongoDB config → default "M5"
+        if timeframe == "M5":  # hanya override jika masih default
+            timeframe = config.get("timeframe", "M5").upper()
+
+        # Baca max_daily_loss_pct dari MongoDB config
+        max_daily_loss_pct = float(config.get("max_daily_loss_pct", 10.0))  # default 10%
+
+        logger.info("Backtest: timeframe=%s max_daily_loss_pct=%.1f%%", timeframe, max_daily_loss_pct)
 
         if not self._llm._api_key:
             msg = "OPENROUTER_API_KEY tidak diset di .env"
@@ -106,6 +130,10 @@ class BacktestEngine:
             current_balance = initial_capital
             candles_since_eval = 0
 
+            # Daily loss tracking
+            daily_pnl: dict[str, float] = {}       # key: "YYYY-MM-DD", value: total PnL hari itu
+            daily_trade_count: dict[str, int] = {}  # key: "YYYY-MM-DD:SESSION", value: trade count
+
             for i in range(100, total_candles):
                 # Cek cancel flag dari MongoDB setiap 10 candle
                 if i % 10 == 0 and self._is_cancelled(run_id):
@@ -127,7 +155,8 @@ class BacktestEngine:
                     })
                     return
 
-                candles_so_far = all_candles[0:i + 1]
+                # Ambil slice candle — batasi 200 candle terakhir untuk hemat token LLM
+                candles_window = all_candles[max(0, i - 199): i + 1]
                 current_candle = all_candles[i]
 
                 if i % 30 == 0:
@@ -154,6 +183,12 @@ class BacktestEngine:
                         virtual_position["pnl"] = pnl
                         current_balance += pnl
                         virtual_position["balance_after"] = current_balance
+
+                        # Update daily PnL tracker
+                        exit_time = current_candle.get("time")
+                        exit_date_key = exit_time.strftime("%Y-%m-%d") if isinstance(exit_time, datetime) else str(exit_time)[:10]
+                        daily_pnl[exit_date_key] = daily_pnl.get(exit_date_key, 0.0) + pnl
+
                         virtual_trades.append(virtual_position)
                         equity_curve.append({"candle_index": i, "equity": current_balance, "event": f"close_{exit_reason}"})
                         logger.info("Backtest: CLOSE #%d at candle %d reason=%s exit=%.4f pnl=%.2f", len(virtual_trades), i, exit_reason, virtual_position["exit_price"], pnl)
@@ -178,19 +213,52 @@ class BacktestEngine:
                     candles_since_eval += 1
                     if candles_since_eval >= EVAL_INTERVAL:
                         candles_since_eval = 0
+
+                        # ── SESSION FILTER (sinkron dengan orchestrator._is_valid_session) ──
+                        if session not in VALID_SESSIONS:
+                            # Bukan London/NY/Overlap — skip, tidak panggil LLM
+                            equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_session"})
+                            continue
+
+                        # ── DAILY LOSS GUARD ──
+                        candle_time = current_candle.get("time")
+                        date_key = candle_time.strftime("%Y-%m-%d") if isinstance(candle_time, datetime) else str(candle_time)[:10]
+                        today_pnl = daily_pnl.get(date_key, 0.0)
+                        daily_loss_limit = -(initial_capital * max_daily_loss_pct / 100.0)
+
+                        if today_pnl <= daily_loss_limit:
+                            logger.info("Backtest: daily loss limit reached on %s (pnl=%.2f, limit=%.2f) — skip", date_key, today_pnl, daily_loss_limit)
+                            equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_daily_loss"})
+                            continue
+
+                        # ── MAX TRADE PER SESSION GUARD (max 2 trade per sesi per hari) ──
+                        session_day_key = f"{date_key}:{session}"
+                        trades_this_session = daily_trade_count.get(session_day_key, 0)
+                        if trades_this_session >= 2:
+                            equity_curve.append({"candle_index": i, "equity": current_balance, "event": "skip_max_trades"})
+                            continue
+
                         try:
-                            atr = calculate_atr(candles_so_far, period=14)
+                            atr = calculate_atr(candles_window, period=14)
                             agent_result = await self._agent.analyze(
-                                candles=candles_so_far, position=None,
+                                candles=candles_window[-200:],  # ← batasi 200 candle untuk hemat token
+                                position=None,
                                 session=session, atr=atr, symbol=symbol,
                                 balance=current_balance, risk_percent=1.0,
                             )
                             if agent_result.get("decision") == "ENTRY" and agent_result.get("confidence", 0) >= 60:
                                 virtual_position = self._create_virtual_position(agent_result, current_candle, i)
                                 equity_curve.append({"candle_index": i, "equity": current_balance, "event": f"open_{agent_result.get('direction', 'N/A')}"})
-                                logger.info("Backtest: OPEN %s at candle %d price=%.4f conf=%d", agent_result.get("direction"), i, virtual_position["entry_price"], agent_result.get("confidence", 0))
+                                logger.info(
+                                    "Backtest: OPEN %s at candle %d price=%.4f conf=%d session=%s",
+                                    agent_result.get("direction"), i, virtual_position["entry_price"],
+                                    agent_result.get("confidence", 0), session,
+                                )
+                                # Increment session trade counter
+                                daily_trade_count[session_day_key] = trades_this_session + 1
                         except Exception as e:
                             logger.error("Backtest agent error at candle %d: %s", i, e)
+
                     equity_curve.append({"candle_index": i, "equity": current_balance, "event": "scan"})
 
             if virtual_position is not None:

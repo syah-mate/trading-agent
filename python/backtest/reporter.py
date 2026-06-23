@@ -55,6 +55,7 @@ def generate_stats(
             "worst_trades": [],
             "trades_by_session": {},
             "trades_by_direction": {},
+            "session_stats": {},
             "total_pnl": 0.0,
             "final_balance": initial_balance,
         }
@@ -105,6 +106,23 @@ def generate_stats(
         direction = t.get("direction", "UNKNOWN")
         trades_by_direction[direction] = trades_by_direction.get(direction, 0) + 1
 
+    # Session stats — win rate & PnL per session
+    session_stats: dict[str, dict] = {}
+    for t in trades:
+        s = t.get("session", "Other")
+        if s not in session_stats:
+            session_stats[s] = {"total": 0, "wins": 0, "pnl": 0.0}
+        session_stats[s]["total"] += 1
+        if t.get("pnl", 0) > 0:
+            session_stats[s]["wins"] += 1
+        session_stats[s]["pnl"] = round(session_stats[s]["pnl"] + t.get("pnl", 0), 2)
+
+    # Hitung win rate per session
+    for s in session_stats:
+        total = session_stats[s]["total"]
+        wins = session_stats[s]["wins"]
+        session_stats[s]["win_rate"] = round(wins / total * 100, 1) if total > 0 else 0.0
+
     return {
         "total_trades": total_trades,
         "winning_trades": winning_trades,
@@ -127,6 +145,7 @@ def generate_stats(
         "worst_trades": worst_trades,
         "trades_by_session": trades_by_session,
         "trades_by_direction": trades_by_direction,
+        "session_stats": session_stats,
     }
 
 

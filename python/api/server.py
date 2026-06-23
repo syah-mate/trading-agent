@@ -62,11 +62,11 @@ _backtest_current_run_id: str | None = None
 
 class BacktestStartRequest(BaseModel):
     symbol: str = "XAUUSD"
-    timeframe: str = "M15"
+    timeframe: str = "M5"          # ← default M5, sinkron dengan live
     months_back: int | None = None
     days_back: int | None = None
     lot_size: float = 0.01
-    initial_capital: float = 10000.0
+    initial_capital: float = 30.0  # ← default $30 untuk small account
 
 
 class ConfigUpdateRequest(BaseModel):
