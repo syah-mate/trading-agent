@@ -1,14 +1,12 @@
 """
-Orchestrator v2.1 — Always-In Strategy Loop
+Orchestrator v3.1 — S/R Real-Time Tick Loop
 
-Setiap 3 candle M15 baru:
-1. Ambil data candle (200 candle)
-2. Jika ADA posisi aktif → SKIP (tunggu semua posisi closed)
-3. Jika TIDAK ada posisi → WAJIB ENTRY via TradingAgent LLM
-4. Tidak ada STANDBY — selalu open posisi dengan setup terbaik
-5. Rule-based fallback untuk null prices (current price + ATR)
+Dua asyncio task paralel:
+1. _candle_loop() — update S/R levels setiap candle baru close (M5/M15)
+2. _tick_loop()  — poll harga setiap 2 detik, trigger AI saat harga touch S/R
 
-Semua analisis dilakukan oleh SATU LLM call melalui TradingAgent.
+Direction deterministik: support→BUY, resistance→SELL.
+AI hanya bertindak sebagai validator konfirmasi.
 """
 
 import asyncio
@@ -19,6 +17,7 @@ from typing import Any
 from core.mt5_client import MT5Client, detect_session, calculate_atr
 from core.openrouter_client import OpenRouterClient, DEFAULT_MODEL
 from core.mongo_client import MongoClient
+from core.sr_detector import SRDetector, SRLevel
 from agents.trading_agent import TradingAgent
 from agents.mt5_executor import MT5Executor
 from config import (
@@ -28,12 +27,9 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# Jumlah candle baru sebelum menjalankan agent
-CANDLE_INTERVAL = 1  # M5 scalp: cek setiap candle baru
-
 
 class Orchestrator:
-    """Master loop — simplified single-agent architecture."""
+    """Master loop — S/R real-time tick loop architecture v3.1."""
 
     def __init__(self) -> None:
         # Core clients
@@ -47,23 +43,30 @@ class Orchestrator:
         # Executor
         self._executor = MT5Executor(symbol=SYMBOL, lot_size=LOT_SIZE)
 
-        # State
+        # S/R Detector
+        self._sr_detector = SRDetector()
+
+        # Shared state antar tasks
         self._running: bool = False
-        self._last_agent_candle_time: datetime | None = None
-        self._candles_since_last_run: int = 0
+        self._last_candle_time: datetime | None = None
+        self._m15_candles: list[dict] = []    # di-update oleh candle loop
+        self._m5_candles: list[dict] = []     # di-update oleh candle loop
+        self._sr_levels_ready: bool = False   # True setelah candle loop pertama selesai
+
+        # Cooldown: hindari multiple trigger di level yang sama
+        self._last_trigger_time: datetime | None = None
+        self._last_trigger_price: float | None = None
 
     # ------------------------------------------------------------------
     # Main Loop
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start main loop."""
+        """Start dua loop paralel: candle loop + tick loop."""
         logger.info("=" * 60)
-        logger.info("Orchestrator v2.0 — Single Agent Mode Starting")
-        logger.info("Candle interval: every %d M15 candles", CANDLE_INTERVAL)
+        logger.info("Orchestrator v3.1 — S/R Real-Time Mode Starting")
         logger.info("=" * 60)
 
-        # Connect
         if not self._mt5.connect():
             logger.error("Gagal konek MT5 — exiting")
             return
@@ -73,37 +76,20 @@ class Orchestrator:
             self._mt5.disconnect()
             return
 
-        # Load LLM model dari user config (terpusat dari /config)
         config = self._mongo.get_config()
         llm_model = config.get("llm_model", DEFAULT_MODEL)
         self._llm.set_model(llm_model)
-        logger.info("Orchestrator: LLM model dari config = %s", llm_model)
+        logger.info("LLM model: %s", llm_model)
 
         self._running = True
-        logger.info("Orchestrator: semua koneksi OK, mulai main loop")
 
         try:
-            while self._running:
-                try:
-                    # Cek flag dari MongoDB
-                    if not self._is_running_flag():
-                        logger.info("Orchestrator: agent dihentikan via dashboard — waiting...")
-                        await asyncio.sleep(30)
-                        continue
-
-                    await self._wait_for_candle_interval()
-
-                    # Session filter: hanya entry di London & NY open
-                    if not self._is_valid_session():
-                        logger.info("Orchestrator: bukan sesi aktif — skip cycle")
-                        continue
-
-                    await self.run_cycle()
-                except Exception as e:
-                    logger.error("Orchestrator cycle error: %s", e, exc_info=True)
-                    await asyncio.sleep(5)
+            await asyncio.gather(
+                self._candle_loop(),
+                self._tick_loop(),
+            )
         except KeyboardInterrupt:
-            logger.info("Orchestrator: KeyboardInterrupt diterima")
+            logger.info("Orchestrator: KeyboardInterrupt")
         finally:
             await self._shutdown()
 
@@ -123,167 +109,273 @@ class Orchestrator:
     # Cycle
     # ------------------------------------------------------------------
 
-    async def run_cycle(self) -> dict[str, Any]:
-        """Jalankan 1 siklus evaluasi trading.
+    # ------------------------------------------------------------------
+    # Candle Loop — update S/R levels setiap candle baru
+    # ------------------------------------------------------------------
 
-        Returns:
-            dict — ringkasan cycle untuk logging
+    async def _candle_loop(self) -> None:
+        """Loop: update candle data dan S/R levels setiap candle M5 baru close.
+
+        Poll setiap 30 detik. Saat candle baru terdeteksi:
+        1. Ambil M5 candles terbaru (200 candle)
+        2. Downsample ke M15 untuk S/R detection
+        3. Update SRDetector dengan data M15 terbaru
         """
-        cycle_start = datetime.now(timezone.utc)
-        session = detect_session(cycle_start)
+        logger.info("Candle loop started")
 
-        logger.info("--- Cycle start: %s [%s] ---", cycle_start.isoformat(), session)
+        while self._running:
+            try:
+                if not self._is_running_flag():
+                    await asyncio.sleep(30)
+                    continue
 
-        # STEP 1: Ambil data
-        candles = self._mt5.get_candles(SYMBOL, TIMEFRAME, CANDLES_COUNT)
-        if len(candles) < 100:
-            logger.warning("Cycle: hanya %d candle, skip", len(candles))
-            return {"status": "skip", "reason": "insufficient_candles"}
+                candles_m5 = self._mt5.get_candles(SYMBOL, "M5", 200)
+                if len(candles_m5) < 50:
+                    await asyncio.sleep(30)
+                    continue
 
-        current_price_data = self._mt5.get_current_price(SYMBOL)
-        current_price = (current_price_data["bid"] + current_price_data["ask"]) / 2
-        logger.debug("Current %s: %.4f", SYMBOL, current_price)
+                latest_time = candles_m5[-1].get("time")
 
-        # STEP 2: Cek posisi aktif via MT5
-        open_positions = self._mt5.get_open_positions()
+                if latest_time != self._last_candle_time:
+                    self._last_candle_time = latest_time
+                    self._m5_candles = candles_m5
 
-        if open_positions:
-            logger.info(
-                "Cycle: %d posisi aktif — SKIP (tidak ada monitoring)",
-                len(open_positions),
-            )
-            # Tetap log status
-            for pos in open_positions:
-                entry = float(pos.get("price_open", 0))
-                sl = float(pos.get("sl", 0))
-                tp = float(pos.get("tp", 0))
-                pnl = self._calc_pnl(pos, current_price)
-                logger.info(
-                    "  Pos #%d: %s entry=%.4f sl=%.4f tp=%.4f pnl=%+.2f",
-                    pos.get("ticket"),
-                    "BUY" if pos.get("type") in (0, "BUY") else "SELL",
-                    entry, sl, tp, pnl,
-                )
+                    # Downsample ke M15 untuk S/R detection
+                    m15 = self._agent._downsample_to_m15(candles_m5)
+                    self._m15_candles = m15
 
-            cycle_result = {
-                "status": "holding",
-                "positions": len(open_positions),
-                "reason": "Posisi aktif — menunggu SL/TP",
-            }
-        else:
-            # STEP 3: Tidak ada posisi → WAJIB ENTRY (v2.1 always-in)
-            logger.info("Cycle: tidak ada posisi — evaluasi sinyal via TradingAgent...")
+                    # Update S/R detector
+                    self._sr_detector.update(m15)
+                    self._sr_levels_ready = True
 
-            atr = calculate_atr(candles, period=14)
-
-            # Get account info
-            account = self._mt5.get_account_info()
-            balance = account.get("balance", 10000.0)
-
-            # Load risk percent from config
-            config = self._mongo.get_config()
-            risk_percent = float(config.get("risk_percent", 1.0))
-
-            agent_result = await self._agent.analyze(
-                candles=candles,
-                position=None,
-                session=session,
-                atr=atr,
-                symbol=SYMBOL,
-                balance=balance,
-                risk_percent=risk_percent,
-            )
-
-            # v3.0: Cek apakah agent memutuskan STANDBY
-            decision = agent_result.get("decision", "ENTRY")
-
-            if decision == "STANDBY":
-                reason = agent_result.get("reason", "")
-                logger.info("Orchestrator: agent STANDBY — %s", reason)
-
-                self._mongo.insert_log({
-                    "type": "standby",
-                    "cycle_at": cycle_start,
-                    "session": session,
-                    "reason": reason,
-                })
-
-                cycle_result = {
-                    "status": "standby",
-                    "reason": reason,
-                }
-            else:
-                # ENTRY: isi null prices jika perlu
-                agent_result = self._fill_missing_prices(
-                    agent_result, candles, current_price, atr, balance, risk_percent,
-                )
-
-                # Log signal
-                self._mongo.insert_log({
-                    "type": "agent_decision",
-                    "cycle_at": cycle_start,
-                    "session": session,
-                    "decision": agent_result,
-                })
-
-                # Simpan signal ke MongoDB
-                self._mongo.insert_signal(agent_result)
-
-                # v3.0: Eksekusi trade (hanya untuk ENTRY)
-                direction = agent_result.get("direction")
-                confidence = agent_result.get("confidence", 0)
-                logger.info(
-                    ">>> OPENING %s confidence=%d <<<", direction, confidence,
-                )
-
-                trade = self._executor.open_position(agent_result)
-
-                if "error" in trade:
-                    logger.error("Eksekusi trade gagal: %s", trade["error"])
-                    cycle_result = {
-                        "status": "execution_failed",
-                        "error": trade["error"],
-                    }
-                else:
-                    # Simpan trade ke MongoDB
-                    trade["symbol"] = SYMBOL
-                    trade["confidence"] = confidence
-                    trade["entry_reason"] = agent_result.get("reason", "")
-                    trade["session"] = session
-                    trade["bias_htf"] = agent_result.get("bias_htf")
-                    trade["rr_ratio_t1"] = agent_result.get("rr_ratio_t1")
-                    trade["rr_ratio_t2"] = agent_result.get("rr_ratio_t2")
-                    trade["tp2_price"] = agent_result.get("tp2_price")
-                    self._mongo.insert_trade(trade)
-
-                    cycle_result = {
-                        "status": "trade_opened",
-                        "ticket": trade.get("ticket"),
-                        "direction": trade.get("direction"),
-                        "confidence": confidence,
-                    }
-
+                    summary = self._sr_detector.summary()
                     logger.info(
-                        ">>> TRADE OPENED: ticket=%d %s entry=%.4f sl=%.4f tp=%.4f <<<",
-                        trade.get("ticket"), direction,
-                        trade.get("entry_price"),
-                        trade.get("sl"),
-                        trade.get("tp"),
+                        "Candle loop: new candle %s | S/R: %d fresh levels (%d support, %d resistance)",
+                        latest_time,
+                        summary["fresh_levels"],
+                        len(summary["supports"]),
+                        len(summary["resistances"]),
                     )
 
-        # Update status
+                    # Simpan S/R summary ke MongoDB untuk dashboard
+                    self._mongo.upsert_config({"sr_levels": summary, "last_cycle_at": latest_time})
+
+            except Exception as e:
+                logger.error("Candle loop error: %s", e, exc_info=True)
+
+            await asyncio.sleep(30)
+
+        logger.info("Candle loop stopped")
+
+    # ------------------------------------------------------------------
+    # Tick Loop — poll harga real-time, trigger AI saat touch S/R
+    # ------------------------------------------------------------------
+
+    async def _tick_loop(self) -> None:
+        """Loop: poll harga setiap 2 detik, trigger AI konfirmasi saat harga menyentuh S/R fresh.
+
+        Flow saat touch terdeteksi:
+        1. Cek session filter (London/NY only)
+        2. Cek cooldown (hindari trigger berulang di level sama)
+        3. Cek apakah ada posisi aktif (skip jika ada)
+        4. Panggil TradingAgent.analyze() sebagai validator
+        5. Jika ENTRY → open posisi
+        """
+        logger.info("Tick loop started — polling every 2 seconds")
+
+        # Tunggu candle loop selesai inisialisasi
+        while self._running and not self._sr_levels_ready:
+            await asyncio.sleep(1)
+
+        logger.info("Tick loop: S/R levels ready, mulai monitoring harga")
+
+        TRIGGER_COOLDOWN_SECONDS = 300  # 5 menit
+
+        while self._running:
+            try:
+                if not self._is_running_flag():
+                    await asyncio.sleep(5)
+                    continue
+
+                # 1. Ambil harga terkini
+                price_data = self._mt5.get_current_price(SYMBOL)
+                if not price_data or price_data.get("bid", 0) == 0:
+                    await asyncio.sleep(2)
+                    continue
+
+                current_price = (price_data["bid"] + price_data["ask"]) / 2
+                now = datetime.now(timezone.utc)
+
+                # 2. Session filter
+                if not self._is_valid_session():
+                    await asyncio.sleep(10)  # cek setiap 10 detik saat non-session
+                    continue
+
+                # 3. Cek posisi aktif — skip jika sedang holding
+                open_positions = self._mt5.get_open_positions()
+                if open_positions:
+                    await asyncio.sleep(2)
+                    continue
+
+                # 4. Cek S/R touch
+                if not self._m5_candles:
+                    await asyncio.sleep(2)
+                    continue
+
+                touched_levels = self._sr_detector.check_touch(current_price, candle_time=now)
+
+                if not touched_levels:
+                    await asyncio.sleep(2)
+                    continue
+
+                # Ambil level terdekat
+                sr_level = min(touched_levels, key=lambda lv: abs(lv.price - current_price))
+
+                # 5. Cooldown check
+                if self._last_trigger_time is not None:
+                    elapsed = (now - self._last_trigger_time).total_seconds()
+                    if elapsed < TRIGGER_COOLDOWN_SECONDS:
+                        logger.debug(
+                            "Tick loop: cooldown aktif (%.0fs tersisa)",
+                            TRIGGER_COOLDOWN_SECONDS - elapsed,
+                        )
+                        await asyncio.sleep(2)
+                        continue
+
+                logger.info(
+                    "Tick loop: TOUCH DETECTED! price=%.4f level=%.4f (%s) — calling AI validator...",
+                    current_price, sr_level.price, sr_level.kind,
+                )
+
+                self._last_trigger_time = now
+                self._last_trigger_price = current_price
+
+                # 6. Panggil AI untuk validasi
+                await self._handle_sr_touch(sr_level, current_price, now)
+
+            except Exception as e:
+                logger.error("Tick loop error: %s", e, exc_info=True)
+
+            await asyncio.sleep(2)
+
+        logger.info("Tick loop stopped")
+
+    # ------------------------------------------------------------------
+    # SR Touch Handler — AI validation + eksekusi
+    # ------------------------------------------------------------------
+
+    async def _handle_sr_touch(
+        self,
+        sr_level: "SRLevel",
+        current_price: float,
+        now: datetime,
+    ) -> None:
+        """Handle saat harga menyentuh level S/R — validasi via AI, eksekusi jika ENTRY.
+
+        Direction sudah deterministik:
+            support   → BUY
+            resistance → SELL
+        """
+        session = detect_session(now)
+
+        if not self._m5_candles:
+            logger.warning("_handle_sr_touch: m5_candles belum ada, skip")
+            return
+
+        atr = calculate_atr(self._m5_candles, period=14)
+        account = self._mt5.get_account_info()
+        balance = account.get("balance", 30.0)
+
+        config = self._mongo.get_config()
+        risk_percent = float(config.get("risk_percent", 1.0))
+
+        # Panggil AI sebagai validator
+        agent_result = await self._agent.analyze(
+            candles=self._m5_candles,
+            position=None,
+            session=session,
+            atr=atr,
+            symbol=SYMBOL,
+            balance=balance,
+            risk_percent=risk_percent,
+            sr_level=sr_level.to_dict(),
+        )
+
+        decision = agent_result.get("decision", "STANDBY")
+
+        # Log ke MongoDB
         self._mongo.insert_log({
-            "type": "cycle_summary",
-            "cycle_at": cycle_start,
+            "type": "sr_validation",
+            "triggered_at": now,
+            "sr_level": sr_level.to_dict(),
+            "current_price": current_price,
             "session": session,
-            "result": cycle_result,
+            "decision": decision,
+            "confidence": agent_result.get("confidence", 0),
+            "reason": agent_result.get("reason", ""),
         })
 
-        # Update last_cycle_at di config (single source of truth)
-        self._mongo.upsert_config({"last_cycle_at": cycle_start})
+        if decision != "ENTRY":
+            logger.info(
+                "_handle_sr_touch: AI STANDBY — %s",
+                agent_result.get("reason", ""),
+            )
+            return
 
-        logger.info("--- Cycle end: %s ---", cycle_result.get("status"))
-        return cycle_result
+        # ENTRY: tentukan direction dari jenis level
+        direction = "BUY" if sr_level.kind == "support" else "SELL"
+        agent_result["direction"] = direction
+        agent_result["entry_price"] = current_price
+
+        # Isi harga yang belum diisi (TP $1, SL dari AI atau ATR fallback)
+        agent_result = self._fill_missing_prices(
+            agent_result, self._m5_candles, current_price, atr, balance, risk_percent,
+        )
+
+        # Guard RR
+        if agent_result.get("_skip_low_rr"):
+            logger.info("_handle_sr_touch: RR terlalu rendah — skip")
+            return
+
+        confidence = agent_result.get("confidence", 0)
+        logger.info(
+            ">>> OPENING %s at %.4f confidence=%d (S/R level %.4f %s) <<<",
+            direction, current_price, confidence, sr_level.price, sr_level.kind,
+        )
+
+        trade = self._executor.open_position(agent_result)
+
+        if "error" in trade:
+            logger.error("Eksekusi trade gagal: %s", trade["error"])
+            return
+
+        trade["symbol"] = SYMBOL
+        trade["confidence"] = confidence
+        trade["entry_reason"] = agent_result.get("reason", "")
+        trade["session"] = session
+        trade["sr_level"] = sr_level.to_dict()
+        trade["bias_htf"] = agent_result.get("bias_htf")
+        trade["rr_ratio_t1"] = agent_result.get("rr_ratio_t1")
+
+        self._mongo.insert_trade(trade)
+        self._mongo.insert_signal(agent_result)
+
+        logger.info(
+            ">>> TRADE OPENED: ticket=%d %s entry=%.4f sl=%.4f tp=%.4f <<<",
+            trade.get("ticket", 0), direction,
+            trade.get("entry_price", 0),
+            trade.get("sl", 0),
+            trade.get("tp", 0),
+        )
+
+    # ------------------------------------------------------------------
+    # Deprecated methods (dipertahankan untuk backward compatibility)
+    # ------------------------------------------------------------------
+
+    async def run_cycle(self) -> dict[str, Any]:
+        """Deprecated — gunakan tick loop + _handle_sr_touch. Dipertahankan untuk API compatibility."""
+        logger.warning("run_cycle() dipanggil langsung — method ini deprecated di v3.1")
+        return {"status": "deprecated", "message": "Gunakan tick loop. Lihat _handle_sr_touch."}
 
     # ------------------------------------------------------------------
     # Session Validator (v3.0)
@@ -329,44 +421,9 @@ class Orchestrator:
             return True  # default: running
 
     async def _wait_for_candle_interval(self) -> None:
-        """Tunggu sampai CANDLE_INTERVAL candle M15 baru tersedia.
-
-        Cek setiap 30 detik apakah candle baru sudah terbentuk.
-        """
-        while self._running:
-            # Ambil candle terbaru
-            candles = self._mt5.get_candles(SYMBOL, TIMEFRAME, 5)
-            if len(candles) < 2:
-                await asyncio.sleep(30)
-                continue
-
-            latest_candle_time = candles[-1].get("time")
-
-            if self._last_agent_candle_time is None:
-                # Pertama kali — catat candle saat ini
-                self._last_agent_candle_time = latest_candle_time
-                self._candles_since_last_run = 0
-                logger.info(
-                    "Orchestrator: initial candle tracked — %s",
-                    latest_candle_time,
-                )
-                await asyncio.sleep(30)
-                continue
-
-            if latest_candle_time != self._last_agent_candle_time:
-                # Candle baru!
-                self._candles_since_last_run += 1
-                self._last_agent_candle_time = latest_candle_time
-
-                if self._candles_since_last_run >= CANDLE_INTERVAL:
-                    self._candles_since_last_run = 0
-                    logger.info(
-                        "Orchestrator: %d candles elapsed — running agent",
-                        CANDLE_INTERVAL,
-                    )
-                    return
-
-            await asyncio.sleep(30)
+        """Deprecated — gunakan _candle_loop() di v3.1. Dipertahankan untuk backward compatibility."""
+        logger.warning("_wait_for_candle_interval() dipanggil — method ini deprecated di v3.1")
+        await asyncio.sleep(30)
 
     # ------------------------------------------------------------------
     # Fallback Price Filler (v2.1 — always-in)
@@ -383,11 +440,11 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """Isi null prices dengan rule-based fallback agar trade tetap bisa dibuka.
 
-        Rules:
+        Rules v3.1:
         - entry_price = current_price
-        - SL = ATR × 1.5 dari entry (searah bias)
-        - TP1 = ATR × 1.5 dari entry (RR ~1:1)
-        - TP2 = ATR × 3.0 dari entry (RR ~1:2)
+        - SL = ATR × 1.5 dari entry (searah bias) atau dari AI
+        - TP1 = fixed $1 target (1.0 / (lot × 100) distance)
+        - No TP2 (dihapus per design v3.1)
         - lot_size = kalkulasi risk-based dari balance & SL distance
         - direction = dari bias_htf, atau dari price vs mid-range
         """
@@ -421,8 +478,6 @@ class Orchestrator:
 
         entry = float(result["entry_price"])
         sl_mult = 1.5
-        tp1_mult = 1.5
-        tp2_mult = 3.0
 
         # Fill SL
         if result.get("sl_price") is None:
@@ -432,36 +487,41 @@ class Orchestrator:
                 result["sl_price"] = round(entry + atr * sl_mult, 5)
             logger.info("_fill_missing_prices: sl_price = %.5f (ATR×%.1f)", result["sl_price"], sl_mult)
 
-        # Fill TP1
+        # Fill TP1 — FIXED $1 target untuk 0.01 lot XAUUSD
+        # $1 = tp_distance × lot × 100  →  tp_distance = 1.0 / (lot × 100)
+        lot_for_calc = float(result.get("lot_size") or 0.01)
+        tp_distance = 1.0 / (lot_for_calc * 100)   # untuk 0.01 lot = $1.00 move
+
         if result.get("tp1_price") is None:
             if direction == "BUY":
-                result["tp1_price"] = round(entry + atr * tp1_mult, 5)
+                result["tp1_price"] = round(entry + tp_distance, 5)
             else:
-                result["tp1_price"] = round(entry - atr * tp1_mult, 5)
-            logger.info("_fill_missing_prices: tp1_price = %.5f (ATR×%.1f)", result["tp1_price"], tp1_mult)
+                result["tp1_price"] = round(entry - tp_distance, 5)
+            logger.info(
+                "_fill_missing_prices: tp1_price = %.5f (fixed $1 target, distance=%.4f)",
+                result["tp1_price"], tp_distance,
+            )
 
-        # Fill TP2
-        if result.get("tp2_price") is None:
-            if direction == "BUY":
-                result["tp2_price"] = round(entry + atr * tp2_mult, 5)
-            else:
-                result["tp2_price"] = round(entry - atr * tp2_mult, 5)
-            logger.info("_fill_missing_prices: tp2_price = %.5f (ATR×%.1f)", result["tp2_price"], tp2_mult)
+        # Tidak ada TP2 (dihapus per design v3.1)
+        result.pop("tp2_price", None)
+        result.pop("rr_ratio_t2", None)
 
-        # Fill RR ratios
+        # Fill RR ratio (SL vs TP $1)
         sl = float(result["sl_price"])
         tp1 = float(result["tp1_price"])
-        tp2 = float(result["tp2_price"])
-
         if result.get("rr_ratio_t1") is None:
-            r = abs(entry - sl)
-            r1 = abs(tp1 - entry)
-            result["rr_ratio_t1"] = round(r1 / r, 2) if r > 0 else 1.0
+            risk = abs(entry - sl)
+            reward = abs(tp1 - entry)
+            result["rr_ratio_t1"] = round(reward / risk, 2) if risk > 0 else 1.0
 
-        if result.get("rr_ratio_t2") is None:
-            r = abs(entry - sl)
-            r2 = abs(tp2 - entry)
-            result["rr_ratio_t2"] = round(r2 / r, 2) if r > 0 else 2.0
+        # Guard: jika RR < 0.8, skip entry
+        rr = result.get("rr_ratio_t1", 0)
+        if rr < 0.8:
+            logger.warning(
+                "_fill_missing_prices: RR terlalu rendah (%.2f < 0.8) — tandai SKIP",
+                rr,
+            )
+            result["_skip_low_rr"] = True
 
         # Fill lot_size
         if result.get("lot_size") is None:

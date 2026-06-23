@@ -51,31 +51,21 @@ Format JSON:
 {
   "decision": "ENTRY" | "STANDBY",
   "direction": "BUY" | "SELL" | "NONE",
-  "entry_price": number | null,
   "sl_price": number | null,
-  "tp1_price": number | null,
-  "tp2_price": number | null,
-  "lot_size": number | null,
-  "rr_ratio_t1": number | null,
-  "rr_ratio_t2": number | null,
   "confidence": number (0-100),
   "bias_htf": "BULLISH" | "BEARISH" | "RANGING",
-  "intraday_phase": "TRENDING" | "PULLBACK" | "CONSOLIDATION",
-  "reason": "string — alasan singkat (max 300 chars)",
-  "invalidation": "string — kondisi yang membatalkan setup ini (max 200 chars)",
-  "risk_percent": number
+  "momentum": "STRONG" | "WEAK" | "NEUTRAL",
+  "reason": "string — alasan konfirmasi S/R (max 200 chars)",
+  "invalidation": "string — kondisi yang membatalkan entry (max 150 chars)"
 }
 ```
 
-Jika decision = "STANDBY":
-- Isi "reason" dengan alasan jelas (mis. "M15 ranging, tidak ada bias jelas")
-- Field lain boleh null/0
-- direction boleh "NONE"
-
-Jika decision = "ENTRY":
-- SEMUA field wajib diisi
-- SL maksimum 10 pip dari entry
-- RR T1 minimum 0.8
+CATATAN:
+- entry_price, tp_price, lot_size TIDAK PERLU diisi — dihitung otomatis oleh sistem
+- direction TIDAK PERLU diisi — ditentukan dari jenis level (support→BUY, resistance→SELL)
+- sl_price: harga SL yang aman, di balik level S/R + buffer ATR × 1.2
+- Jika decision = "STANDBY": isi reason, sl_price boleh null
+- Jika decision = "ENTRY": sl_price WAJIB diisi
 """
 
 
@@ -129,6 +119,7 @@ class TradingAgent:
         symbol: str = "XAUUSDc",
         balance: float = 10000.0,
         risk_percent: float = 1.0,
+        sr_level: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Analisis candle data & posisi (jika ada), return keputusan trading.
 
@@ -165,6 +156,7 @@ class TradingAgent:
             symbol=symbol,
             balance=balance,
             risk_percent=risk_percent,
+            sr_level=sr_level,
         )
 
         logger.info(
@@ -205,6 +197,7 @@ class TradingAgent:
         symbol: str,
         balance: float,
         risk_percent: float,
+        sr_level: dict[str, Any] | None = None,
     ) -> str:
         """Build detailed user prompt with OHLCV data for LLM analysis."""
 
@@ -236,6 +229,18 @@ class TradingAgent:
         recent_low = min(all_lows)
         current_price = float(candles[-1]["close"])
 
+        # S/R level yang disentuh (trigger dari tick loop)
+        sr_context = "Tidak ada level S/R yang disentuh saat ini."
+        if sr_level:
+            sr_context = f"""LEVEL YANG DISENTUH:
+  Tipe   : {sr_level.get('kind', '').upper()}
+  Harga  : {sr_level.get('price', 0):.4f}
+  Tests  : {sr_level.get('test_count', 0)} kali
+  Terbentuk: {sr_level.get('formed_at', 'N/A')}
+
+Harga saat ini {current_price:.4f} menyentuh level {sr_level.get('kind')} di {sr_level.get('price', 0):.4f}.
+{"Posisi yang tepat: BUY (harga di support)" if sr_level.get('kind') == 'support' else "Posisi yang tepat: SELL (harga di resistance)"}"""
+
         # Posisi aktif
         position_str = "TIDAK ADA POSISI AKTIF"
         if position:
@@ -253,19 +258,14 @@ class TradingAgent:
 
         return f"""=== TRADING CONTEXT ===
 Symbol: {symbol}
-Timeframe: M5 (entry) / M15 (HTF bias)
 Session: {session}
-Current Price: {current_price:.2f}
+Current Price: {current_price:.4f}
 ATR (14): {atr:.4f}
-Balance: ${balance:,.2f}
-Risk per Trade: {risk_percent}%
 
-=== KEY LEVELS (100 candle terakhir) ===
-Recent High: {recent_high:.2f}
-Recent Low: {recent_low:.2f}
-Mid Range: {((recent_high + recent_low) / 2):.2f}
+=== S/R LEVEL YANG DISENTUH (TRIGGER) ===
+{sr_context}
 
-=== M15 CANDLES (HTF Bias - 20 terakhir, hasil downsample M5→M15) ===
+=== M15 CANDLES (HTF Bias - 20 terakhir) ===
 {m15_str}
 
 === M5 CANDLES (Entry TF - 30 terakhir) ===
@@ -276,19 +276,17 @@ Mid Range: {((recent_high + recent_low) / 2):.2f}
 
 ---
 
-Jalankan TOP-DOWN ANALYSIS sesuai system prompt v3.0:
-1. FASE 1: Baca struktur M15 → tentukan BIAS (BULLISH/BEARISH) atau RANGING
-2. FASE 2: Jika RANGING atau sesi tidak valid → output STANDBY
-3. FASE 3: Jika ada bias jelas → cari setup M5 (BoS retest / rejection wick / engulfing)
-4. FASE 4: Kalkulasi SL (maks 10 pip) dan TP (min RR 0.8)
+Kamu adalah VALIDATOR — harga baru saja menyentuh level S/R di atas.
+Tugasmu HANYA mengkonfirmasi apakah level ini valid untuk entry SEKARANG.
 
-INGAT:
-- STANDBY diperbolehkan jika kondisi tidak mendukung
-- SL TIDAK BOLEH melebihi 10 pip
-- Hanya entry di session London (07:00–10:00 UTC) atau NY (12:00–15:00 UTC)
-- Modal sangat terbatas ($30) — capital preservation > profit hunting
+PERTANYAAN:
+1. Apakah struktur M15 mendukung entry di level ini? (HTF bias sesuai?)
+2. Apakah ada momentum konfirmasi di M5? (wick rejection, engulfing, BoS?)
+3. Apakah SL yang aman ada di bawah/atas level ini?
 
-Respond HANYA dengan JSON, tidak ada teks lain."""
+Jika YA semua → ENTRY. Jika ada keraguan → STANDBY.
+
+Respond HANYA dengan JSON sesuai format. Tidak ada teks lain."""
 
     # ------------------------------------------------------------------
     # Helpers
@@ -399,7 +397,7 @@ Respond HANYA dengan JSON, tidak ada teks lain."""
 
         decision = str(raw.get("decision", "ENTRY")).upper()
 
-        # v3.0: Handle STANDBY
+        # v3.1: Handle STANDBY
         if decision == "STANDBY":
             return {
                 "decision": "STANDBY",
@@ -407,16 +405,13 @@ Respond HANYA dengan JSON, tidak ada teks lain."""
                 "entry_price": None,
                 "sl_price": None,
                 "tp1_price": None,
-                "tp2_price": None,
                 "lot_size": None,
                 "rr_ratio_t1": None,
-                "rr_ratio_t2": None,
                 "confidence": self._safe_int(raw.get("confidence"), 0),
                 "bias_htf": str(raw.get("bias_htf", "RANGING")).upper(),
-                "intraday_phase": raw.get("intraday_phase") or "CONSOLIDATION",
-                "reason": str(raw.get("reason", "Kondisi tidak mendukung entry"))[:300],
+                "momentum": "NEUTRAL",
+                "reason": str(raw.get("reason", "Kondisi tidak mendukung entry"))[:200],
                 "invalidation": "N/A",
-                "risk_percent": 1.0,
                 "analyzed_at": now,
                 "session": session,
                 "atr": atr,
@@ -447,19 +442,16 @@ Respond HANYA dengan JSON, tidak ada teks lain."""
         result: dict[str, Any] = {
             "decision": "ENTRY",
             "direction": direction,
-            "entry_price": self._safe_float(raw.get("entry_price")),
+            "entry_price": None,        # diisi oleh orchestrator (current_price)
             "sl_price": self._safe_float(raw.get("sl_price")),
-            "tp1_price": self._safe_float(raw.get("tp1_price")),
-            "tp2_price": self._safe_float(raw.get("tp2_price")),
-            "lot_size": self._safe_float(raw.get("lot_size")),
-            "rr_ratio_t1": self._safe_float(raw.get("rr_ratio_t1")),
-            "rr_ratio_t2": self._safe_float(raw.get("rr_ratio_t2")),
+            "tp1_price": None,          # diisi oleh orchestrator ($1 fixed target)
+            "lot_size": None,           # diisi oleh orchestrator (0.01 fixed)
+            "rr_ratio_t1": None,        # dihitung oleh orchestrator
             "confidence": self._safe_int(raw.get("confidence"), 40),
             "bias_htf": bias_htf,
-            "intraday_phase": raw.get("intraday_phase") or "TRENDING",
-            "reason": str(raw.get("reason", ""))[:300],
-            "invalidation": str(raw.get("invalidation", ""))[:200],
-            "risk_percent": self._safe_float(raw.get("risk_percent")),
+            "momentum": str(raw.get("momentum", "NEUTRAL")).upper(),
+            "reason": str(raw.get("reason", ""))[:200],
+            "invalidation": str(raw.get("invalidation", ""))[:150],
             "analyzed_at": now,
             "session": session,
             "atr": atr,
