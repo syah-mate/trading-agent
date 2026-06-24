@@ -53,3 +53,24 @@ MAX_SL_PIPS: float = 10.0         # Maksimum SL = 10 pip untuk modal kecil
 MIN_RR_RATIO: float = 0.8         # Minimum RR sebelum entry
 MAX_TRADES_PER_SESSION: int = 2   # Maksimum 2 trade per sesi
 MAX_DAILY_LOSS_PCT: float = 10.0  # Stop trading jika daily loss ≥ 10% modal
+
+# ---------------------------------------------------------------------------
+# Trading Parameters — dibaca dari MongoDB config, ini hanya default fallback
+# ---------------------------------------------------------------------------
+
+# Lot size (fixed)
+LOT_FIX: float = float(os.getenv("LOT_FIX", "0.01"))
+
+# TP config
+# tp_mode: "fixed" = pakai tp_pips dari user, "ai" = AI yang tentukan
+TP_MODE: str = os.getenv("TP_MODE", "fixed")   # "fixed" | "ai"
+TP_PIPS: float = float(os.getenv("TP_PIPS", "10.0"))  # pip, hanya berlaku jika tp_mode=fixed
+
+# SL config
+# sl_mode: "fixed" = pakai sl_pips dari user, "ai" = AI yang tentukan
+SL_MODE: str = os.getenv("SL_MODE", "ai")      # "fixed" | "ai"
+SL_PIPS: float = float(os.getenv("SL_PIPS", "10.0"))  # pip, hanya berlaku jika sl_mode=fixed
+
+# Konversi pip ke price distance untuk XAUUSDc
+# 1 pip = $0.10 move → distance = pips * 0.10
+XAUUSD_PIP_VALUE: float = 0.10

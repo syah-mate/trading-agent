@@ -100,11 +100,16 @@ class BacktestStartRequest(BaseModel):
 
 class ConfigUpdateRequest(BaseModel):
     symbol: str | None = None
-    lot_size: float | None = None
+    lot_fix: float | None = None              # lot size fixed (ganti lot_size)
     confidence_threshold: int | None = None
     sessions: dict | None = None
     max_daily_loss: float | None = None
     llm_model: str | None = None
+    # --- Trading Parameters ---
+    tp_mode: str | None = None               # "fixed" | "ai"
+    tp_pips: float | None = None             # pip, hanya jika tp_mode="fixed"
+    sl_mode: str | None = None               # "fixed" | "ai"
+    sl_pips: float | None = None             # pip, hanya jika sl_mode="fixed"
 
 
 # ---------------------------------------------------------------------------
@@ -395,13 +400,20 @@ async def get_config() -> dict[str, Any]:
 
     config = mongo_client.get_config()
     if not config:
+        from config import LOT_FIX, TP_MODE, TP_PIPS, SL_MODE, SL_PIPS
+
         config = {
-            "symbol": "XAUUSD",
-            "lot_size": 0.01,
+            "symbol": "XAUUSDc",
+            "lot_fix": LOT_FIX,
             "confidence_threshold": 70,
             "sessions": {"London": True, "NewYork": True, "Overlap": True, "Asia": False},
             "max_daily_loss": 50.0,
             "llm_model": DEFAULT_MODEL,
+            # Trading parameters
+            "tp_mode": TP_MODE,
+            "tp_pips": TP_PIPS,
+            "sl_mode": SL_MODE,
+            "sl_pips": SL_PIPS,
         }
     return _serialize_doc(config)
 
@@ -422,6 +434,18 @@ async def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
 
     if not updates:
         return {"success": True, "updated_fields": []}
+
+    # Validasi tp_mode dan sl_mode
+    if "tp_mode" in updates and updates["tp_mode"] not in ("fixed", "ai"):
+        raise HTTPException(400, "tp_mode harus 'fixed' atau 'ai'")
+    if "sl_mode" in updates and updates["sl_mode"] not in ("fixed", "ai"):
+        raise HTTPException(400, "sl_mode harus 'fixed' atau 'ai'")
+    if "lot_fix" in updates and updates["lot_fix"] <= 0:
+        raise HTTPException(400, "lot_fix harus > 0")
+    if "tp_pips" in updates and updates["tp_pips"] <= 0:
+        raise HTTPException(400, "tp_pips harus > 0")
+    if "sl_pips" in updates and updates["sl_pips"] <= 0:
+        raise HTTPException(400, "sl_pips harus > 0")
 
     ok = mongo_client.upsert_config(updates)
     if not ok:

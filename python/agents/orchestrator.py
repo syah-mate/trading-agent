@@ -21,8 +21,10 @@ from core.sr_detector import SRDetector, SRLevel
 from agents.trading_agent import TradingAgent
 from agents.mt5_executor import MT5Executor
 from config import (
-    SYMBOL, TIMEFRAME, LOT_SIZE, CANDLES_COUNT,
-    CONFIDENCE_THRESHOLD,
+    SYMBOL, TIMEFRAME, LOT_FIX, CANDLES_COUNT,
+    CANDLE_INTERVAL, MAX_SL_PIPS, MIN_RR_RATIO,
+    MAX_TRADES_PER_SESSION, MAX_DAILY_LOSS_PCT,
+    TP_MODE, TP_PIPS, SL_MODE, SL_PIPS, XAUUSD_PIP_VALUE,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,8 +42,8 @@ class Orchestrator:
         # Single agent
         self._agent = TradingAgent(self._llm)
 
-        # Executor
-        self._executor = MT5Executor(symbol=SYMBOL, lot_size=LOT_SIZE)
+        # Executor (lot_size di-inject dari MongoDB config saat start())
+        self._executor: MT5Executor | None = None
 
         # S/R Detector
         self._sr_detector = SRDetector()
@@ -56,6 +58,27 @@ class Orchestrator:
         # Cooldown: hindari multiple trigger di level yang sama
         self._last_trigger_time: datetime | None = None
         self._last_trigger_price: float | None = None
+
+    # ------------------------------------------------------------------
+    # Trading Params dari MongoDB config
+    # ------------------------------------------------------------------
+
+    def _get_trading_params(self) -> dict:
+        """Baca lot, TP, SL params dari MongoDB config.
+
+        Priority: MongoDB config → config.py default → hardcoded fallback.
+
+        Returns dict dengan keys:
+            lot_fix, tp_mode, tp_pips, sl_mode, sl_pips
+        """
+        config = self._mongo.get_config() or {}
+        return {
+            "lot_fix":  float(config.get("lot_fix",  LOT_FIX)),
+            "tp_mode":  str(config.get("tp_mode",  TP_MODE)).lower(),
+            "tp_pips":  float(config.get("tp_pips",  TP_PIPS)),
+            "sl_mode":  str(config.get("sl_mode",  SL_MODE)).lower(),
+            "sl_pips":  float(config.get("sl_pips",  SL_PIPS)),
+        }
 
     # ------------------------------------------------------------------
     # Main Loop
@@ -82,6 +105,11 @@ class Orchestrator:
         logger.info("LLM model: %s", llm_model)
 
         self._running = True
+
+        # Initialize executor dengan lot dari MongoDB config
+        params = self._get_trading_params()
+        self._executor = MT5Executor(symbol=SYMBOL, lot_size=params["lot_fix"])
+        logger.info("Executor initialized: symbol=%s lot=%.2f", SYMBOL, params["lot_fix"])
 
         try:
             await asyncio.gather(
@@ -327,9 +355,11 @@ class Orchestrator:
         agent_result["direction"] = direction
         agent_result["entry_price"] = current_price
 
-        # Isi harga yang belum diisi (TP $1, SL dari AI atau ATR fallback)
+        # Isi harga yang belum diisi — pakai trading params dari MongoDB config
+        trading_params = self._get_trading_params()
         agent_result = self._fill_missing_prices(
             agent_result, self._m5_candles, current_price, atr, balance, risk_percent,
+            trading_params=trading_params,
         )
 
         # Guard RR
@@ -437,20 +467,27 @@ class Orchestrator:
         atr: float,
         balance: float,
         risk_percent: float,
+        trading_params: dict,          # ← parameter baru
     ) -> dict[str, Any]:
         """Isi null prices dengan rule-based fallback agar trade tetap bisa dibuka.
 
-        Rules v3.1:
+        Rules v3.2 (centralized config):
         - entry_price = current_price
-        - SL = ATR × 1.5 dari entry (searah bias) atau dari AI
-        - TP1 = fixed $1 target (1.0 / (lot × 100) distance)
-        - No TP2 (dihapus per design v3.1)
-        - lot_size = kalkulasi risk-based dari balance & SL distance
-        - direction = dari bias_htf, atau dari price vs mid-range
+        - Lot = lot_fix dari MongoDB config (fixed, tidak risk-based)
+        - SL = dari AI (jika sl_mode=ai) ATAU fixed pip (jika sl_mode=fixed)
+        - TP = dari AI (jika tp_mode=ai) ATAU fixed pip (jika tp_mode=fixed)
+        - Direction = dari bias_htf, atau dari price vs mid-range
         """
         result = dict(agent_result)
         direction = result.get("direction")
         bias_htf = result.get("bias_htf", "")
+
+        lot_fix  = trading_params["lot_fix"]
+        tp_mode  = trading_params["tp_mode"]
+        tp_pips  = trading_params["tp_pips"]
+        sl_mode  = trading_params["sl_mode"]
+        sl_pips  = trading_params["sl_pips"]
+        pip_val  = XAUUSD_PIP_VALUE  # 0.10
 
         # Tentukan direction jika null
         if direction not in ("BUY", "SELL"):
@@ -471,74 +508,86 @@ class Orchestrator:
                 direction, current_price, mid_range,
             )
 
+        direction = str(result.get("direction", "BUY")).upper()
+
         # Fill entry_price
         if result.get("entry_price") is None:
             result["entry_price"] = round(current_price, 5)
             logger.info("_fill_missing_prices: entry_price = current_price = %.5f", current_price)
 
         entry = float(result["entry_price"])
-        sl_mult = 1.5
 
-        # Fill SL
-        if result.get("sl_price") is None:
+        # ── LOT SIZE (selalu pakai lot_fix dari config) ──────────────────────────
+        result["lot_size"] = lot_fix
+        logger.info("_fill_missing_prices: lot_size = %.2f (dari config lot_fix)", lot_fix)
+
+        # ── SL ───────────────────────────────────────────────────────────────────
+        if result.get("sl_price") is None or sl_mode == "fixed":
+            sl_distance = sl_pips * pip_val   # contoh: 10 pip × 0.10 = $1.00 distance
             if direction == "BUY":
-                result["sl_price"] = round(entry - atr * sl_mult, 5)
+                result["sl_price"] = round(entry - sl_distance, 5)
             else:
-                result["sl_price"] = round(entry + atr * sl_mult, 5)
-            logger.info("_fill_missing_prices: sl_price = %.5f (ATR×%.1f)", result["sl_price"], sl_mult)
+                result["sl_price"] = round(entry + sl_distance, 5)
+            logger.info(
+                "_fill_missing_prices: sl_price = %.5f (mode=%s, pips=%.1f, distance=%.4f)",
+                result["sl_price"], sl_mode, sl_pips, sl_distance,
+            )
+        elif sl_mode == "ai":
+            # Pakai sl_price dari AI, tapi validasi tidak melampaui MAX_SL_PIPS
+            if result.get("sl_price") is not None:
+                actual_sl_distance = abs(entry - float(result["sl_price"]))
+                max_sl_distance = MAX_SL_PIPS * pip_val
+                if actual_sl_distance > max_sl_distance:
+                    logger.warning(
+                        "_fill_missing_prices: AI sl_price terlalu jauh (%.4f > max %.4f) — fallback ke ATR",
+                        actual_sl_distance, max_sl_distance,
+                    )
+                    sl_distance = min(atr * 1.2, max_sl_distance)
+                    if direction == "BUY":
+                        result["sl_price"] = round(entry - sl_distance, 5)
+                    else:
+                        result["sl_price"] = round(entry + sl_distance, 5)
+            else:
+                # AI tidak memberikan SL → fallback ATR
+                sl_distance = min(atr * 1.2, MAX_SL_PIPS * pip_val)
+                if direction == "BUY":
+                    result["sl_price"] = round(entry - sl_distance, 5)
+                else:
+                    result["sl_price"] = round(entry + sl_distance, 5)
 
-        # Fill TP1 — FIXED $1 target untuk 0.01 lot XAUUSD
-        # $1 = tp_distance × lot × 100  →  tp_distance = 1.0 / (lot × 100)
-        lot_for_calc = float(result.get("lot_size") or 0.01)
-        tp_distance = 1.0 / (lot_for_calc * 100)   # untuk 0.01 lot = $1.00 move
+        sl = float(result["sl_price"])
 
-        if result.get("tp1_price") is None:
+        # ── TP ───────────────────────────────────────────────────────────────────
+        if result.get("tp1_price") is None or tp_mode == "fixed":
+            tp_distance = tp_pips * pip_val   # contoh: 10 pip × 0.10 = $1.00 distance
             if direction == "BUY":
                 result["tp1_price"] = round(entry + tp_distance, 5)
             else:
                 result["tp1_price"] = round(entry - tp_distance, 5)
             logger.info(
-                "_fill_missing_prices: tp1_price = %.5f (fixed $1 target, distance=%.4f)",
-                result["tp1_price"], tp_distance,
+                "_fill_missing_prices: tp1_price = %.5f (mode=%s, pips=%.1f, distance=%.4f)",
+                result["tp1_price"], tp_mode, tp_pips, tp_distance,
             )
+        # Jika tp_mode == "ai": pakai tp1_price dari AI (sudah ada di result)
 
-        # Tidak ada TP2 (dihapus per design v3.1)
-        result.pop("tp2_price", None)
-        result.pop("rr_ratio_t2", None)
-
-        # Fill RR ratio (SL vs TP $1)
-        sl = float(result["sl_price"])
         tp1 = float(result["tp1_price"])
-        if result.get("rr_ratio_t1") is None:
-            risk = abs(entry - sl)
-            reward = abs(tp1 - entry)
-            result["rr_ratio_t1"] = round(reward / risk, 2) if risk > 0 else 1.0
 
-        # Guard: jika RR < 0.8, skip entry
-        rr = result.get("rr_ratio_t1", 0)
-        if rr < 0.8:
+        # ── RR RATIO ──────────────────────────────────────────────────────────────
+        risk   = abs(entry - sl)
+        reward = abs(tp1 - entry)
+        result["rr_ratio_t1"] = round(reward / risk, 2) if risk > 0 else 1.0
+
+        # ── RR GUARD ──────────────────────────────────────────────────────────────
+        if result["rr_ratio_t1"] < MIN_RR_RATIO:
             logger.warning(
-                "_fill_missing_prices: RR terlalu rendah (%.2f < 0.8) — tandai SKIP",
-                rr,
+                "_fill_missing_prices: RR terlalu rendah (%.2f < %.2f) — tandai SKIP",
+                result["rr_ratio_t1"], MIN_RR_RATIO,
             )
             result["_skip_low_rr"] = True
 
-        # Fill lot_size
-        if result.get("lot_size") is None:
-            risk_amount = balance * (risk_percent / 100.0)
-            sl_distance = abs(entry - sl)
-            # XAUUSD: 1 lot = $100 per $1 move (100 oz × $1)
-            # lot = risk_amount / (sl_distance × 100)
-            if sl_distance > 0:
-                lot = risk_amount / (sl_distance * 100)
-                lot = max(0.01, round(lot, 2))  # min 0.01 lot
-            else:
-                lot = 0.01
-            result["lot_size"] = lot
-            logger.info(
-                "_fill_missing_prices: lot_size = %.2f (risk=$%.2f, sl_distance=%.4f)",
-                lot, risk_amount, sl_distance,
-            )
+        # Hapus TP2 jika ada (tidak dipakai di v3.1)
+        result.pop("tp2_price", None)
+        result.pop("rr_ratio_t2", None)
 
         # Fill risk_percent
         if result.get("risk_percent") is None:

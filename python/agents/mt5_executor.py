@@ -24,9 +24,14 @@ class MT5Executor:
         executor.close_position(ticket=12345)
     """
 
-    def __init__(self, symbol: str = "XAUUSD", lot_size: float = 0.01) -> None:
+    def __init__(self, symbol: str = "XAUUSDc", lot_size: float = 0.01) -> None:
+        """
+        Args:
+            lot_size: lot size dari config (LOT_FIX). Tidak hardcode di sini —
+                      nilai ini di-inject dari orchestrator saat startup.
+        """
         self._symbol: str = symbol
-        self._lot_size: float = lot_size
+        self._lot_size: float = lot_size  # di-set dari orchestrator via _get_trading_params()
 
     # ------------------------------------------------------------------
     # Open Position

@@ -1,12 +1,17 @@
 <script>
 	import { fetchConfig, updateConfig } from '$lib/api';
 
-	let symbol = $state('XAUUSD');
-	let lotSize = $state(0.01);
+	let symbol = $state('XAUUSDc');
+	let lotFix = $state(0.01);
 	let confidenceThreshold = $state(70);
 	let sessions = $state({ London: true, NewYork: true, Overlap: true, Asia: false });
 	let maxDailyLoss = $state(50);
 	let llmModel = $state('google/gemini-2.5-flash-lite');
+	// Trading Parameters
+	let tpMode = $state('fixed');
+	let tpPips = $state(10.0);
+	let slMode = $state('ai');
+	let slPips = $state(10.0);
 	let loading = $state(true);
 	let saving = $state(false);
 	let message = $state('');
@@ -18,12 +23,16 @@
 		async function load() {
 			try {
 				const config = await fetchConfig();
-				symbol = config.symbol || 'XAUUSD';
-				lotSize = config.lot_size ?? 0.01;
+				symbol = config.symbol || 'XAUUSDc';
+				lotFix = config.lot_fix ?? 0.01;
 				confidenceThreshold = config.confidence_threshold ?? 70;
 				sessions = config.sessions || { London: true, NewYork: true, Overlap: true, Asia: false };
 				maxDailyLoss = config.max_daily_loss ?? 50;
-				llmModel = config.llm_model || 'x-ai/grok-4.3';
+				llmModel = config.llm_model || 'google/gemini-2.5-flash-lite';
+				tpMode = config.tp_mode || 'fixed';
+				tpPips = config.tp_pips ?? 10.0;
+				slMode = config.sl_mode || 'ai';
+				slPips = config.sl_pips ?? 10.0;
 				rawConfig = config;
 			} catch (e) {
 				message = '❌ Gagal load config: ' + (e.message || 'Unknown error');
@@ -40,11 +49,15 @@
 		message = '';
 		const config = {
 			symbol,
-			lot_size: lotSize,
+			lot_fix: lotFix,
 			confidence_threshold: confidenceThreshold,
 			sessions,
 			max_daily_loss: maxDailyLoss,
-			llm_model: llmModel
+			llm_model: llmModel,
+			tp_mode: tpMode,
+			tp_pips: tpPips,
+			sl_mode: slMode,
+			sl_pips: slPips,
 		};
 		try {
 			await updateConfig(config);
@@ -97,8 +110,8 @@
 			</div>
 
 			<div>
-				<label class="text-sm text-gray-400 block mb-1">Lot Size</label>
-				<input type="number" step="0.01" min="0.01" max="10" bind:value={lotSize} class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-emerald-500 focus:outline-none" />
+				<label class="text-sm text-gray-400 block mb-1">Lot Size (Fixed)</label>
+				<input type="number" step="0.01" min="0.01" max="10" bind:value={lotFix} class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-emerald-500 focus:outline-none" />
 			</div>
 
 			<div>
@@ -136,6 +149,79 @@
 						<option value={m}>{m}</option>
 					{/each}
 				</select>
+			</div>
+
+			<!-- Trading Parameters: TP & SL -->
+			<div class="border-t border-gray-800 pt-4 mt-4">
+				<h3 class="text-sm font-semibold text-emerald-400 mb-3">🎯 Take Profit & Stop Loss</h3>
+
+				<!-- TP Mode -->
+				<div class="mb-4">
+					<label class="text-sm text-gray-400 block mb-2">TP Mode</label>
+					<div class="flex gap-2">
+						<button
+							onclick={() => tpMode = 'fixed'}
+							class="px-4 py-1.5 rounded-lg text-sm border transition-colors {tpMode === 'fixed' ? 'bg-emerald-900/30 border-emerald-700 text-emerald-300' : 'bg-gray-800 border-gray-700 text-gray-500'}"
+						>
+							Fixed (Pips)
+						</button>
+						<button
+							onclick={() => tpMode = 'ai'}
+							class="px-4 py-1.5 rounded-lg text-sm border transition-colors {tpMode === 'ai' ? 'bg-emerald-900/30 border-emerald-700 text-emerald-300' : 'bg-gray-800 border-gray-700 text-gray-500'}"
+						>
+							AI Decide
+						</button>
+					</div>
+				</div>
+
+				<!-- TP Pips (hanya muncul jika fixed) -->
+				{#if tpMode === 'fixed'}
+					<div class="mb-4">
+						<label class="text-sm text-gray-400 block mb-1">
+							TP Distance (pips) = {tpPips} pip
+							<span class="text-gray-600"> ≈ ${(tpPips * 0.10).toFixed(2)} price move</span>
+						</label>
+						<input type="range" min="1" max="50" step="0.5" bind:value={tpPips} class="w-full accent-emerald-500" />
+						<div class="flex justify-between text-xs text-gray-600">
+							<span>1 pip ($0.10)</span>
+							<span>50 pip ($5.00)</span>
+						</div>
+					</div>
+				{/if}
+
+				<!-- SL Mode -->
+				<div class="mb-4">
+					<label class="text-sm text-gray-400 block mb-2">SL Mode</label>
+					<div class="flex gap-2">
+						<button
+							onclick={() => slMode = 'fixed'}
+							class="px-4 py-1.5 rounded-lg text-sm border transition-colors {slMode === 'fixed' ? 'bg-emerald-900/30 border-emerald-700 text-emerald-300' : 'bg-gray-800 border-gray-700 text-gray-500'}"
+						>
+							Fixed (Pips)
+						</button>
+						<button
+							onclick={() => slMode = 'ai'}
+							class="px-4 py-1.5 rounded-lg text-sm border transition-colors {slMode === 'ai' ? 'bg-emerald-900/30 border-emerald-700 text-emerald-300' : 'bg-gray-800 border-gray-700 text-gray-500'}"
+						>
+							AI Decide
+						</button>
+					</div>
+				</div>
+
+				<!-- SL Pips (hanya muncul jika fixed) -->
+				{#if slMode === 'fixed'}
+					<div class="mb-4">
+						<label class="text-sm text-gray-400 block mb-1">
+							SL Distance (pips) = {slPips} pip
+							<span class="text-gray-600"> ≈ ${(slPips * 0.10).toFixed(2)} price move</span>
+						</label>
+						<input type="range" min="1" max="50" step="0.5" bind:value={slPips} class="w-full accent-emerald-500" />
+						<div class="flex justify-between text-xs text-gray-600">
+							<span>1 pip ($0.10)</span>
+							<span>50 pip ($5.00)</span>
+						</div>
+					</div>
+				{/if}
 			</div>
 
 			<div class="flex items-center gap-4 pt-2">

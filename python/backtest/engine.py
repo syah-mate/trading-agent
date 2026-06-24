@@ -144,6 +144,21 @@ class BacktestEngine:
         self._llm.set_model(llm_model)
         logger.info("Backtest: LLM model dari config = %s", llm_model)
 
+        # Baca trading params dari MongoDB config
+        from config import LOT_FIX, TP_MODE, TP_PIPS, SL_MODE, SL_PIPS, XAUUSD_PIP_VALUE
+
+        lot_fix  = float(config.get("lot_fix",  LOT_FIX))
+        tp_mode  = str(config.get("tp_mode",  TP_MODE)).lower()
+        tp_pips  = float(config.get("tp_pips",  TP_PIPS))
+        sl_mode  = str(config.get("sl_mode",  SL_MODE)).lower()
+        sl_pips  = float(config.get("sl_pips",  SL_PIPS))
+        pip_val  = XAUUSD_PIP_VALUE  # 0.10
+
+        logger.info(
+            "Backtest params: lot=%.2f | TP=%s(%.1f pip) | SL=%s(%.1f pip)",
+            lot_fix, tp_mode, tp_pips, sl_mode, sl_pips,
+        )
+
         # Baca timeframe dari MongoDB config jika tidak di-override caller
         # Priority: parameter caller → MongoDB config → default "M5"
         if timeframe == "M5":  # hanya override jika masih default
@@ -345,7 +360,13 @@ class BacktestEngine:
                             agent_result["direction"] = direction
                             agent_result["entry_price"] = current_price_close
 
-                            virtual_position = self._create_virtual_position(agent_result, current_candle, i)
+                            virtual_position = self._create_virtual_position(
+                                agent_result, current_candle, i,
+                                trading_params={
+                                    "lot_fix": lot_fix, "tp_mode": tp_mode, "tp_pips": tp_pips,
+                                    "sl_mode": sl_mode, "sl_pips": sl_pips,
+                                },
+                            )
                             equity_curve.append({
                                 "candle_index": i,
                                 "equity": current_balance,
@@ -461,49 +482,83 @@ class BacktestEngine:
                 return "tp_hit"
         return None
 
-    def _create_virtual_position(self, agent_result: dict[str, Any], candle: dict[str, Any], candle_idx: int) -> dict[str, Any]:
-        direction = agent_result.get("direction")
+    def _create_virtual_position(
+        self,
+        agent_result: dict[str, Any],
+        candle: dict[str, Any],
+        candle_idx: int,
+        trading_params: dict,          # ← parameter baru
+    ) -> dict[str, Any]:
+        direction   = agent_result.get("direction", "BUY")
         entry_price = float(agent_result.get("entry_price") or candle["close"])
+        lot_fix     = trading_params["lot_fix"]
+        tp_mode     = trading_params["tp_mode"]
+        tp_pips     = trading_params["tp_pips"]
+        sl_mode     = trading_params["sl_mode"]
+        sl_pips     = trading_params["sl_pips"]
+        pip_val     = 0.10  # XAUUSD_PIP_VALUE
 
-        # TP fixed $1 untuk 0.01 lot XAUUSD
-        # $1 = tp_distance × lot × 100 → tp_distance = 1.0 / (0.01 × 100) = 1.0
-        LOT = 0.01
-        tp_distance = 1.0 / (LOT * 100)  # = 1.0 dollar move
-        if direction == "BUY":
-            tp_price = round(entry_price + tp_distance, 5)
-        else:
-            tp_price = round(entry_price - tp_distance, 5)
-
-        sl_price = float(agent_result.get("sl_price", 0) or 0)
-        # Fallback SL jika AI tidak memberikan
-        if sl_price == 0:
-            atr = agent_result.get("atr", 0.5)
+        # ── TP ────────────────────────────────────────────────────────────────────
+        if tp_mode == "fixed":
+            tp_distance = tp_pips * pip_val
             if direction == "BUY":
-                sl_price = round(entry_price - atr * 1.2, 5)
+                tp_price = round(entry_price + tp_distance, 5)
             else:
-                sl_price = round(entry_price + atr * 1.2, 5)
+                tp_price = round(entry_price - tp_distance, 5)
+        else:
+            # tp_mode == "ai": pakai dari agent_result jika ada
+            tp_price = float(agent_result.get("tp1_price") or 0)
+            if tp_price == 0:
+                # Fallback ke fixed jika AI tidak berikan TP
+                tp_distance = tp_pips * pip_val
+                tp_price = round(entry_price + tp_distance if direction == "BUY" else entry_price - tp_distance, 5)
+
+        # ── SL ────────────────────────────────────────────────────────────────────
+        if sl_mode == "fixed":
+            sl_distance = sl_pips * pip_val
+            if direction == "BUY":
+                sl_price = round(entry_price - sl_distance, 5)
+            else:
+                sl_price = round(entry_price + sl_distance, 5)
+        else:
+            # sl_mode == "ai": pakai dari agent_result jika ada
+            sl_price = float(agent_result.get("sl_price") or 0)
+            if sl_price == 0:
+                # Fallback ke ATR jika AI tidak berikan SL
+                atr = agent_result.get("atr", 0.5)
+                sl_distance = atr * 1.2
+                if direction == "BUY":
+                    sl_price = round(entry_price - sl_distance, 5)
+                else:
+                    sl_price = round(entry_price + sl_distance, 5)
 
         return {
+            "opened_at_candle": candle_idx,
+            "entry_price": entry_price,
             "direction": direction,
-            "entry_price": float(entry_price),
             "sl": sl_price,
             "tp": tp_price,
-            "opened_at_candle": candle_idx,
+            "volume": lot_fix,       # ← dari config, bukan hardcode
             "opened_at": candle.get("time"),
             "entry_reason": agent_result.get("reason", ""),
-            "bias_htf": agent_result.get("bias_htf"),
             "confidence": agent_result.get("confidence", 0),
             "rr_ratio_t1": agent_result.get("rr_ratio_t1"),
-            "session": agent_result.get("session", "Other"),
-            "volume": 0.01,
+            "session": agent_result.get("session", ""),
+            "sr_level": agent_result.get("sr_level"),
+            "bias_htf": agent_result.get("bias_htf"),
         }
 
     @staticmethod
     def _calc_pnl(position: dict[str, Any]) -> float:
+        """Hitung PnL virtual position dalam USD (XAUUSD).
+
+        Formula: PnL = price_diff × volume × 100
+        1 lot XAUUSD = 100 oz, setiap $1 move = $100 per lot.
+        """
         d = 1 if position["direction"] == "BUY" else -1
         entry = float(position["entry_price"])
         exit_p = float(position.get("exit_price", entry))
-        vol = float(position.get("volume", 0.01))
+        vol = float(position.get("volume", 0.01))  # dari position, bukan hardcode
         # XAUUSD: 1 lot = 100 oz, 0.01 lot = 1 oz, $1 move = $1
         return ((exit_p - entry) if d == 1 else (entry - exit_p)) * 100 * vol
 
